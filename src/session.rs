@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::bridge::AudioBridge;
@@ -9,7 +10,6 @@ use crate::config::Config;
 use crate::mumble::{MumbleClient, MumbleCommand, MumbleEvent, MumbleVoice};
 use crate::webrtc::{WebrtcEvent, WebrtcSession};
 use crate::ws::messages::*;
-use mumble_protocol::crypt::ClientCryptState;
 use tokio::sync::oneshot;
 
 /// Represents a connected user's full session
@@ -22,7 +22,32 @@ struct UserSession {
     ws_tx: mpsc::UnboundedSender<ServerMessage>,
     username: String,
     session_id: Option<u32>,
-    crypt_state_rx: Option<oneshot::Receiver<ClientCryptState>>,
+    voice_setup_task: Option<JoinHandle<()>>,
+}
+
+fn abort_background_task(task: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = task.take() {
+        task.abort();
+    }
+}
+
+async fn shutdown_user_session(session: &mut UserSession) {
+    abort_background_task(&mut session.voice_setup_task);
+
+    if let Some(bridge) = session.bridge.take() {
+        bridge.shutdown().await;
+    }
+
+    if let Some(mut voice) = session.mumble_voice.take() {
+        voice.shutdown();
+    }
+
+    if let Err(err) = session.webrtc_session.close().await {
+        warn!(
+            "Failed to close WebRTC session for '{}': {}",
+            session.username, err
+        );
+    }
 }
 
 /// Manages all active user sessions
@@ -91,7 +116,7 @@ impl SessionManager {
             ws_tx: ws_tx.clone(),
             username: username.to_string(),
             session_id: None,
-            crypt_state_rx: None, // will be set in process_events
+            voice_setup_task: None,
         }));
 
         self.sessions
@@ -113,9 +138,7 @@ impl SessionManager {
     /// Handle SDP offer from browser
     pub async fn handle_offer(&self, conn_id: &str, sdp: &str) -> Result<String, String> {
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(conn_id)
-            .ok_or("Session not found")?;
+        let session = sessions.get(conn_id).ok_or("Session not found")?;
         let session = session.lock().await;
         session
             .webrtc_session
@@ -133,9 +156,7 @@ impl SessionManager {
         sdp_mline_index: Option<u16>,
     ) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(conn_id)
-            .ok_or("Session not found")?;
+        let session = sessions.get(conn_id).ok_or("Session not found")?;
         let session = session.lock().await;
         session
             .webrtc_session
@@ -152,9 +173,7 @@ impl SessionManager {
         message: &str,
     ) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(conn_id)
-            .ok_or("Session not found")?;
+        let session = sessions.get(conn_id).ok_or("Session not found")?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -168,9 +187,7 @@ impl SessionManager {
     /// Join channel
     pub async fn join_channel(&self, conn_id: &str, channel_id: u32) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(conn_id)
-            .ok_or("Session not found")?;
+        let session = sessions.get(conn_id).ok_or("Session not found")?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -181,9 +198,7 @@ impl SessionManager {
     /// Set mute state
     pub async fn set_mute(&self, conn_id: &str, muted: bool) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(conn_id)
-            .ok_or("Session not found")?;
+        let session = sessions.get(conn_id).ok_or("Session not found")?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -194,9 +209,7 @@ impl SessionManager {
     /// Set deaf state
     pub async fn set_deaf(&self, conn_id: &str, deafened: bool) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let session = sessions
-            .get(conn_id)
-            .ok_or("Session not found")?;
+        let session = sessions.get(conn_id).ok_or("Session not found")?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -207,14 +220,11 @@ impl SessionManager {
     /// Disconnect user
     pub async fn disconnect_user(&self, conn_id: &str) {
         if let Some(session) = self.sessions.write().await.remove(conn_id) {
-            let session = session.lock().await;
+            let mut session = session.lock().await;
             let _ = session
                 .mumble_client
                 .send_command(MumbleCommand::Disconnect);
-            if let Some(bridge) = &session.bridge {
-                bridge.shutdown().await;
-            }
-            let _ = session.webrtc_session.close().await;
+            shutdown_user_session(&mut session).await;
             info!(
                 "User '{}' disconnected (conn_id={})",
                 session.username, conn_id
@@ -223,26 +233,16 @@ impl SessionManager {
     }
 
     /// Process Mumble events and WebRTC events for a session
-    async fn process_events(
-        conn_id: String,
-        session: Arc<Mutex<UserSession>>,
-        config: Config,
-    ) {
+    async fn process_events(conn_id: String, session: Arc<Mutex<UserSession>>, config: Config) {
         // Take event receivers out of the session to avoid holding the lock
         let (mut mumble_event_rx, mut webrtc_event_rx, ws_tx, crypt_state_rx) = {
             let mut s = session.lock().await;
-            let mumble_rx = std::mem::replace(
-                &mut s.mumble_client.event_rx,
-                mpsc::unbounded_channel().1,
-            );
-            let webrtc_rx = std::mem::replace(
-                &mut s.webrtc_session.event_rx,
-                mpsc::unbounded_channel().1,
-            );
-            let crypt_rx = std::mem::replace(
-                &mut s.mumble_client.crypt_state_rx,
-                oneshot::channel().1,
-            );
+            let mumble_rx =
+                std::mem::replace(&mut s.mumble_client.event_rx, mpsc::unbounded_channel().1);
+            let webrtc_rx =
+                std::mem::replace(&mut s.webrtc_session.event_rx, mpsc::unbounded_channel().1);
+            let crypt_rx =
+                std::mem::replace(&mut s.mumble_client.crypt_state_rx, oneshot::channel().1);
             (mumble_rx, webrtc_rx, s.ws_tx.clone(), crypt_rx)
         };
 
@@ -254,7 +254,7 @@ impl SessionManager {
         let config_clone = config.clone();
         let conn_id_clone = conn_id.clone();
         let ws_tx_clone = ws_tx.clone();
-        tokio::spawn(async move {
+        let voice_setup_task = tokio::spawn(async move {
             match crypt_state_rx.await {
                 Ok(crypt_state) => {
                     let addr = config_clone
@@ -263,30 +263,50 @@ impl SessionManager {
                         .ok()
                         .and_then(|mut a| a.next());
 
-                    if let Some(addr) = addr {
-                        match MumbleVoice::start(addr, crypt_state).await {
-                            Ok(voice) => {
-                                let mut s = session_clone.lock().await;
-                                let webrtc_audio_rx = std::mem::replace(
-                                    &mut s.webrtc_session.audio_rx,
-                                    mpsc::unbounded_channel().1,
-                                );
-                                let bridge = AudioBridge::start(
-                                    voice.voice_rx,
-                                    voice.voice_tx,
-                                    webrtc_audio_rx,
-                                    s.webrtc_session.outgoing_track.clone(),
-                                );
-                                s.bridge = Some(bridge);
-                                info!("Audio bridge started for {}", conn_id_clone);
+                    let Some(addr) = addr else {
+                        error!("Failed to resolve voice address for {}", conn_id_clone);
+                        let _ = ws_tx_clone.send(ServerMessage::error(
+                            "voice_error",
+                            "Voice setup failed: could not resolve Mumble server address",
+                        ));
+                        return;
+                    };
+
+                    match MumbleVoice::start(addr, crypt_state).await {
+                        Ok(mut voice) => {
+                            let mut s = session_clone.lock().await;
+                            let webrtc_audio_rx = std::mem::replace(
+                                &mut s.webrtc_session.audio_rx,
+                                mpsc::unbounded_channel().1,
+                            );
+                            match voice.take_channels() {
+                                Ok((voice_rx, voice_tx)) => {
+                                    let bridge = AudioBridge::start(
+                                        voice_rx,
+                                        voice_tx,
+                                        webrtc_audio_rx,
+                                        s.webrtc_session.outgoing_track.clone(),
+                                    );
+                                    s.mumble_voice = Some(voice);
+                                    s.bridge = Some(bridge);
+                                    info!("Audio bridge started for {}", conn_id_clone);
+                                }
+                                Err(e) => {
+                                    voice.shutdown();
+                                    error!("Failed to attach voice channels: {}", e);
+                                    let _ = ws_tx_clone.send(ServerMessage::error(
+                                        "voice_error",
+                                        format!("Voice setup failed: {}", e),
+                                    ));
+                                }
                             }
-                            Err(e) => {
-                                error!("Failed to start voice: {}", e);
-                                let _ = ws_tx_clone.send(ServerMessage::error(
-                                    "voice_error",
-                                    format!("Voice setup failed: {}", e),
-                                ));
-                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to start voice: {}", e);
+                            let _ = ws_tx_clone.send(ServerMessage::error(
+                                "voice_error",
+                                format!("Voice setup failed: {}", e),
+                            ));
                         }
                     }
                 }
@@ -295,6 +315,11 @@ impl SessionManager {
                 }
             }
         });
+
+        {
+            let mut s = session.lock().await;
+            s.voice_setup_task = Some(voice_setup_task);
+        }
 
         loop {
             tokio::select! {
@@ -385,5 +410,40 @@ impl SessionManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_background_task_cancels_pending_work() {
+        let (drop_tx, drop_rx) = oneshot::channel();
+        let mut task = Some(tokio::spawn(async move {
+            let _signal = DropSignal(Some(drop_tx));
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+
+        abort_background_task(&mut task);
+
+        assert!(task.is_none());
+        timeout(Duration::from_secs(1), drop_rx)
+            .await
+            .expect("task should be aborted")
+            .expect("drop signal should be delivered");
     }
 }

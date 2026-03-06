@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use mumble_protocol::control::{ClientControlCodec, ControlPacket};
-use mumble_protocol::crypt::ClientCryptState;
+use mumble_protocol::crypt::{ClientCryptState, BLOCK_SIZE, KEY_SIZE};
 use mumble_protocol::Clientbound;
 use std::convert::TryInto;
 use std::net::SocketAddr;
@@ -90,8 +90,7 @@ impl MumbleClient {
         // Spawn the connection loop. We move everything into an async block
         // to avoid specifying the complex Framed codec types explicitly.
         tokio::spawn(async move {
-            let (mut sink, mut stream) =
-                ClientControlCodec::new().framed(tls_stream).split();
+            let (mut sink, mut stream) = ClientControlCodec::new().framed(tls_stream).split();
 
             // Send Version
             let version = proto::build_version_message();
@@ -118,15 +117,14 @@ impl MumbleClient {
             let mut connected = false;
             let mut command_rx = command_rx;
 
-            let mut ping_interval =
-                tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
 
             loop {
                 tokio::select! {
                     packet = stream.next() => {
                         match packet {
                             Some(Ok(packet)) => {
-                                handle_control_packet(
+                                if !handle_control_packet(
                                     packet,
                                     &event_tx,
                                     &mut crypt_state,
@@ -135,7 +133,9 @@ impl MumbleClient {
                                     &mut users,
                                     &mut our_session_id,
                                     &mut connected,
-                                );
+                                ) {
+                                    break;
+                                }
                             }
                             Some(Err(e)) => {
                                 error!("Mumble stream error: {}", e);
@@ -207,6 +207,28 @@ impl MumbleClient {
     }
 }
 
+fn fixed_size_bytes<const N: usize>(
+    bytes: &[u8],
+    field_name: &str,
+) -> std::result::Result<[u8; N], String> {
+    bytes.try_into().map_err(|_| {
+        format!(
+            "Invalid {field_name} size from server: expected {N} bytes, got {}",
+            bytes.len()
+        )
+    })
+}
+
+fn crypt_state_from_message(
+    msg: &mumble_protocol::control::msgs::CryptSetup,
+) -> std::result::Result<ClientCryptState, String> {
+    let key = fixed_size_bytes::<KEY_SIZE>(msg.get_key(), "key")?;
+    let client_nonce = fixed_size_bytes::<BLOCK_SIZE>(msg.get_client_nonce(), "client nonce")?;
+    let server_nonce = fixed_size_bytes::<BLOCK_SIZE>(msg.get_server_nonce(), "server nonce")?;
+
+    Ok(ClientCryptState::new_from(key, client_nonce, server_nonce))
+}
+
 fn handle_control_packet(
     packet: ControlPacket<Clientbound>,
     event_tx: &mpsc::UnboundedSender<MumbleEvent>,
@@ -216,7 +238,7 @@ fn handle_control_packet(
     users: &mut Vec<UserInfo>,
     our_session_id: &mut Option<u32>,
     connected: &mut bool,
-) {
+) -> bool {
     match packet {
         ControlPacket::ChannelState(msg) => {
             let info = ChannelInfo {
@@ -255,9 +277,7 @@ fn handle_control_packet(
             };
             if !*connected {
                 users.push(info);
-            } else if let Some(existing) =
-                users.iter_mut().find(|u| u.session_id == session_id)
-            {
+            } else if let Some(existing) = users.iter_mut().find(|u| u.session_id == session_id) {
                 let state = UserStateData {
                     session_id,
                     channel_id: if msg.has_channel_id() {
@@ -305,21 +325,17 @@ fn handle_control_packet(
                 let _ = event_tx.send(MumbleEvent::UserLeft { session_id });
             }
         }
-        ControlPacket::CryptSetup(msg) => {
-            let cs = ClientCryptState::new_from(
-                msg.get_key()
-                    .try_into()
-                    .expect("Invalid key size from server"),
-                msg.get_client_nonce()
-                    .try_into()
-                    .expect("Invalid client nonce size"),
-                msg.get_server_nonce()
-                    .try_into()
-                    .expect("Invalid server nonce size"),
-            );
-            *crypt_state = Some(cs);
-            debug!("CryptSetup received");
-        }
+        ControlPacket::CryptSetup(msg) => match crypt_state_from_message(msg.as_ref()) {
+            Ok(cs) => {
+                *crypt_state = Some(cs);
+                debug!("CryptSetup received");
+            }
+            Err(reason) => {
+                error!("{reason}");
+                let _ = event_tx.send(MumbleEvent::Disconnected(reason));
+                return false;
+            }
+        },
         ControlPacket::ServerSync(msg) => {
             let session_id = msg.get_session();
             *our_session_id = Some(session_id);
@@ -351,13 +367,60 @@ fn handle_control_packet(
         ControlPacket::Reject(msg) => {
             let reason = format!("{:?}: {}", msg.get_field_type(), msg.get_reason());
             error!("Login rejected: {}", reason);
-            let _ = event_tx.send(MumbleEvent::Disconnected(format!(
-                "Rejected: {}",
-                reason
-            )));
+            let _ = event_tx.send(MumbleEvent::Disconnected(format!("Rejected: {}", reason)));
         }
         _ => {
             // Ignore other packets (Ping, ServerConfig, CodecVersion, etc.)
+        }
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mumble_protocol::control::msgs;
+    use mumble_protocol::crypt::BLOCK_SIZE;
+    use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn invalid_cryptsetup_disconnects_instead_of_panicking() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (crypt_tx, _crypt_rx) = oneshot::channel();
+        let mut crypt_state = None;
+        let mut crypt_tx = Some(crypt_tx);
+        let mut channels = Vec::new();
+        let mut users = Vec::new();
+        let mut our_session_id = None;
+        let mut connected = false;
+
+        let mut msg = msgs::CryptSetup::new();
+        msg.set_key(vec![0; 8]);
+        msg.set_client_nonce(vec![0; BLOCK_SIZE]);
+        msg.set_server_nonce(vec![0; BLOCK_SIZE]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_control_packet(
+                ControlPacket::CryptSetup(Box::new(msg)),
+                &event_tx,
+                &mut crypt_state,
+                &mut crypt_tx,
+                &mut channels,
+                &mut users,
+                &mut our_session_id,
+                &mut connected,
+            );
+        }));
+
+        assert!(result.is_ok(), "CryptSetup handler should not panic");
+        assert!(crypt_state.is_none());
+
+        match event_rx.try_recv() {
+            Ok(MumbleEvent::Disconnected(reason)) => {
+                assert!(reason.contains("Invalid key size"));
+            }
+            other => panic!("expected disconnect event, got {other:?}"),
         }
     }
 }

@@ -6,6 +6,7 @@ use mumble_protocol::voice::{VoicePacket, VoicePacketPayload};
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::udp::UdpFramed;
 use tracing::{debug, error, warn};
 
@@ -28,15 +29,13 @@ pub struct WebrtcVoiceData {
 }
 
 pub struct MumbleVoice {
-    pub voice_rx: mpsc::UnboundedReceiver<MumbleVoiceData>,
-    pub voice_tx: mpsc::UnboundedSender<WebrtcVoiceData>,
+    task: Option<JoinHandle<()>>,
+    voice_rx: Option<mpsc::UnboundedReceiver<MumbleVoiceData>>,
+    voice_tx: Option<mpsc::UnboundedSender<WebrtcVoiceData>>,
 }
 
 impl MumbleVoice {
-    pub async fn start(
-        server_addr: SocketAddr,
-        crypt_state: ClientCryptState,
-    ) -> Result<Self> {
+    pub async fn start(server_addr: SocketAddr, crypt_state: ClientCryptState) -> Result<Self> {
         let (incoming_tx, voice_rx) = mpsc::unbounded_channel();
         let (voice_tx, outgoing_rx) = mpsc::unbounded_channel();
 
@@ -46,7 +45,7 @@ impl MumbleVoice {
 
         debug!("UDP voice socket bound to {}", udp_socket.local_addr()?);
 
-        tokio::spawn(Self::run(
+        let task = tokio::spawn(Self::run(
             udp_socket,
             server_addr,
             crypt_state,
@@ -54,7 +53,51 @@ impl MumbleVoice {
             outgoing_rx,
         ));
 
-        Ok(MumbleVoice { voice_rx, voice_tx })
+        Ok(MumbleVoice {
+            task: Some(task),
+            voice_rx: Some(voice_rx),
+            voice_tx: Some(voice_tx),
+        })
+    }
+
+    pub fn take_channels(
+        &mut self,
+    ) -> Result<(
+        mpsc::UnboundedReceiver<MumbleVoiceData>,
+        mpsc::UnboundedSender<WebrtcVoiceData>,
+    )> {
+        let voice_rx = self
+            .voice_rx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Voice receiver already taken"))?;
+        let voice_tx = self
+            .voice_tx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Voice sender already taken"))?;
+
+        Ok((voice_rx, voice_tx))
+    }
+
+    pub fn shutdown(&mut self) {
+        self.voice_rx.take();
+        self.voice_tx.take();
+
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn from_parts_for_test(
+        task: JoinHandle<()>,
+        voice_rx: mpsc::UnboundedReceiver<MumbleVoiceData>,
+        voice_tx: mpsc::UnboundedSender<WebrtcVoiceData>,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            voice_rx: Some(voice_rx),
+            voice_tx: Some(voice_tx),
+        }
     }
 
     async fn run(
@@ -141,5 +184,48 @@ impl MumbleVoice {
                 }
             }
         }
+    }
+}
+
+impl Drop for MumbleVoice {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_background_voice_task() {
+        let (drop_tx, drop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(drop_tx));
+            std::future::pending::<()>().await;
+        });
+        let (_incoming_tx, voice_rx) = mpsc::unbounded_channel();
+        let (voice_tx, _outgoing_rx) = mpsc::unbounded_channel();
+        tokio::task::yield_now().await;
+
+        let mut voice = MumbleVoice::from_parts_for_test(task, voice_rx, voice_tx);
+        voice.shutdown();
+
+        timeout(Duration::from_secs(1), drop_rx)
+            .await
+            .expect("voice task should be aborted")
+            .expect("drop signal should be delivered");
     }
 }
