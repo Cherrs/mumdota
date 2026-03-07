@@ -1,11 +1,15 @@
+# Values support ${ENV_VAR} and ${ENV_VAR:-default} placeholders.
+# All fields can also be overridden via MUMDOTA_* environment variables
+# (e.g. MUMDOTA_SERVER_LISTEN_PORT=9090, MUMDOTA_MUMBLE_HOST=mumble.example.com).
+
 [server]
-listen_addr = "0.0.0.0"
-listen_port = 8080
-max_connections = 100
+listen_addr = "${MUMDOTA_SERVER_LISTEN_ADDR:-0.0.0.0}"
+listen_port = ${MUMDOTA_SERVER_LISTEN_PORT:-8080}
+max_connections = ${MUMDOTA_SERVER_MAX_CONNECTIONS:-100}
 
 [mumble]
-host = "m.playdota2.win"
-port = 64738
+host = "${MUMDOTA_MUMBLE_HOST:-m.playdota2.win}"
+port = ${MUMDOTA_MUMBLE_PORT:-64738}
 accept_invalid_certs = true
 
 [webrtc]
