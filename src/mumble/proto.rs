@@ -54,3 +54,34 @@ pub fn build_ping() -> msgs::Ping {
     );
     msg
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_text_message_targets_requested_channel() {
+        let msg = build_text_message(7, "hello team");
+
+        assert_eq!(msg.get_channel_id(), &[7]);
+        assert_eq!(msg.get_message(), "hello team");
+    }
+
+    #[test]
+    fn build_user_state_channel_sets_destination_channel() {
+        let msg = build_user_state_channel(9);
+
+        assert!(msg.has_channel_id());
+        assert_eq!(msg.get_channel_id(), 9);
+    }
+
+    #[test]
+    fn build_user_state_deaf_also_self_mutes_when_enabled() {
+        let msg = build_user_state_deaf(true);
+
+        assert!(msg.has_self_deaf());
+        assert!(msg.get_self_deaf());
+        assert!(msg.has_self_mute());
+        assert!(msg.get_self_mute());
+    }
+}

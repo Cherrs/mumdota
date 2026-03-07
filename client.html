@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MumDota 测试客户端</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #1a1b1e;
+    --surface: #25262b;
+    --surface2: #2c2d33;
+    --border: #373a40;
+    --accent: #4dabf7;
+    --accent-dim: #1c3a52;
+    --green: #51cf66;
+    --red: #ff6b6b;
+    --yellow: #ffd43b;
+    --text: #c9d1d9;
+    --text-muted: #6e7681;
+    --radius: 8px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); margin-right: auto; }
+
+  .connect-form { display: flex; gap: 8px; align-items: center; }
+  .connect-form input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 13px;
+    outline: none;
+    width: 160px;
+  }
+  .connect-form input:focus { border-color: var(--accent); }
+  .connect-form input::placeholder { color: var(--text-muted); }
+
+  /* ── Status pill ── */
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 10px;
+    white-space: nowrap;
+  }
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .dot.green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.yellow { background: var(--yellow); }
+  .dot.red { background: var(--red); }
+
+  /* ── Buttons ── */
+  btn, .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: none; border-radius: var(--radius);
+    padding: 6px 14px; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: opacity .15s, filter .15s;
+    user-select: none;
+  }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn:not(:disabled):hover { filter: brightness(1.15); }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .btn-icon {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 16px;
+    border-radius: var(--radius);
+  }
+  .btn-icon.active { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+  .btn-icon.muted-red { background: #3d1a1a; border-color: var(--red); color: var(--red); }
+
+  /* ── Layout ── */
+  .layout {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    width: 220px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+
+  .sidebar-section { padding: 10px 12px 6px; }
+  .sidebar-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+
+  .channel-list, .user-list { overflow-y: auto; flex: 1; }
+
+  .channel-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    cursor: pointer;
+    border-radius: 4px;
+    margin: 1px 6px;
+    color: var(--text-muted);
+    transition: background .1s, color .1s;
+  }
+  .channel-item:hover { background: var(--surface2); color: var(--text); }
+  .channel-item.active { background: var(--accent-dim); color: var(--accent); }
+  .channel-item .ch-icon { font-size: 12px; }
+  .channel-item .ch-name { flex: 1; font-size: 13px; }
+
+  .user-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    margin: 1px 6px;
+    border-radius: 4px;
+  }
+  .user-avatar {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700; color: var(--accent);
+    flex-shrink: 0;
+  }
+  .user-info { flex: 1; min-width: 0; }
+  .user-name { font-size: 13px; font-weight: 500; truncate: ellipsis; overflow: hidden; white-space: nowrap; }
+  .user-state { font-size: 11px; color: var(--text-muted); display: flex; gap: 4px; }
+  .badge { font-size: 10px; }
+  .user-speaking .user-avatar { border-color: var(--green); color: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  .sidebar-divider { border: none; border-top: 1px solid var(--border); margin: 6px 12px; }
+
+  /* ── Main area ── */
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Voice bar ── */
+  .voice-bar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .voice-status { flex: 1; font-size: 13px; color: var(--text-muted); }
+  .voice-status strong { color: var(--text); }
+
+  .level-meter {
+    width: 80px; height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .level-bar {
+    height: 100%;
+    background: var(--green);
+    border-radius: 3px;
+    width: 0%;
+    transition: width .05s;
+  }
+
+  /* ── Chat area ── */
+  .chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .chat-log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .msg { display: flex; gap: 10px; padding: 4px 0; }
+  .msg:hover { background: rgba(255,255,255,.02); border-radius: 4px; }
+  .msg-avatar {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--surface2);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: var(--accent);
+    flex-shrink: 0; margin-top: 2px;
+  }
+  .msg-body { flex: 1; }
+  .msg-header { display: flex; align-items: baseline; gap: 8px; }
+  .msg-sender { font-weight: 600; font-size: 14px; }
+  .msg-time { font-size: 11px; color: var(--text-muted); }
+  .msg-text { color: var(--text); line-height: 1.5; word-break: break-word; }
+  .msg-text a { color: var(--accent); }
+
+  .sys-msg {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+    padding: 4px 0;
+    font-style: italic;
+  }
+
+  /* ── Input bar ── */
+  .input-bar {
+    border-top: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+    background: var(--surface);
+  }
+  .chat-input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    padding: 8px 12px;
+    font-size: 14px;
+    outline: none;
+    resize: none;
+  }
+  .chat-input:focus { border-color: var(--accent); }
+  .chat-input::placeholder { color: var(--text-muted); }
+  .chat-input:disabled { opacity: .5; }
+
+  /* ── Debug log ── */
+  .debug-toggle {
+    position: fixed; bottom: 12px; right: 12px;
+    z-index: 100;
+  }
+  .debug-panel {
+    position: fixed; bottom: 50px; right: 12px;
+    width: 440px; max-height: 300px;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    padding: 8px;
+    z-index: 99;
+    display: none;
+  }
+  .debug-panel.open { display: block; }
+  .log-line { padding: 2px 0; border-bottom: 1px solid #1f2329; }
+  .log-line.tx { color: #58a6ff; }
+  .log-line.rx { color: #56d364; }
+  .log-line.info { color: #8b949e; }
+  .log-line.err { color: #f85149; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* Audio element hidden */
+  audio { display: none; }
+
+  /* Empty state */
+  .empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    gap: 12px;
+  }
+  .empty-icon { font-size: 48px; }
+  .empty-text { font-size: 14px; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <h1>🎙 MumDota</h1>
+  <div class="connect-form">
+    <input id="serverInput" placeholder="服务器地址 (host:port)" value="localhost:8080" />
+    <input id="nickInput" placeholder="用户名" value="WebUser" maxlength="32" />
+    <button class="btn btn-primary" id="btnConnect" onclick="doConnect()">连接</button>
+    <button class="btn btn-danger" id="btnDisconnect" disabled onclick="doDisconnect()">断开</button>
+  </div>
+  <div class="status-pill">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">未连接</span>
+  </div>
+</header>
+
+<!-- Layout -->
+<div class="layout">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">频道</div>
+    </div>
+    <div class="channel-list" id="channelList">
+      <div style="padding: 8px 12px; color: var(--text-muted); font-size: 12px;">连接后显示</div>
+    </div>
+
+    <hr class="sidebar-divider">
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">在线用户</div>
+    </div>
+    <div class="user-list" id="userList">
+      <div style="padding: 8px 12px; color: var(--text-muted); font-size: 12px;">暂无用户</div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+
+    <!-- Voice controls bar -->
+    <div class="voice-bar">
+      <div class="voice-status" id="voiceStatus">语音：<strong>未连接</strong></div>
+      <div class="level-meter" title="麦克风电平">
+        <div class="level-bar" id="levelBar"></div>
+      </div>
+      <button class="btn btn-icon" id="btnMute" title="静音" onclick="toggleMute()" disabled>🎤</button>
+      <button class="btn btn-icon" id="btnDeafen" title="屏蔽音频" onclick="toggleDeafen()" disabled>🔊</button>
+    </div>
+
+    <!-- Chat -->
+    <div class="chat-area">
+      <div class="chat-log" id="chatLog">
+        <div class="empty">
+          <div class="empty-icon">💬</div>
+          <div class="empty-text">连接后即可开始聊天</div>
+        </div>
+      </div>
+
+      <div class="input-bar">
+        <textarea class="chat-input" id="chatInput" placeholder="发送消息（Enter 发送，Shift+Enter 换行）"
+          rows="1" disabled onkeydown="onChatKey(event)"></textarea>
+        <button class="btn btn-primary" id="btnSend" disabled onclick="sendChat()">发送</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Debug panel -->
+<button class="btn btn-ghost debug-toggle" onclick="toggleDebug()" title="协议日志">🔍 日志</button>
+<div class="debug-panel" id="debugPanel"></div>
+
+<script>
+'use strict';
+
+// ── State ──────────────────────────────────────────────────────────────────
+let ws = null;
+let pc = null;
+let localStream = null;
+let analyser = null;
+let levelRaf = null;
+
+let mySessionId = null;
+let myChannelId = 0;
+let isMuted = false;
+let isDeafened = false;
+let channels = {};   // id → {id, name, parent_id, description}
+let users = {};      // session_id → {session_id, name, channel_id, mute, deaf, self_mute, self_deaf}
+
+// ── Connect / Disconnect ───────────────────────────────────────────────────
+async function doConnect() {
+  const server = document.getElementById('serverInput').value.trim() || 'localhost:8080';
+  const nick = document.getElementById('nickInput').value.trim();
+  if (!nick) { alert('请输入用户名'); return; }
+
+  setStatus('connecting', `正在连接 ${server}…`);
+  btnConnect.disabled = true;
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000, channelCount: 1 }
+    });
+  } catch (e) {
+    setStatus('error', '麦克风权限被拒绝');
+    log('err', `getUserMedia 失败: ${e.message}`);
+    btnConnect.disabled = false;
+    return;
+  }
+
+  startLevelMeter(localStream);
+
+  const wsUrl = `ws://${server}/ws`;
+  log('info', `WS → ${wsUrl}`);
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    setStatus('connecting', '已握手，等待 Mumble 认证…');
+    send({ type: 'connect', data: { username: nick } });
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    log('rx', JSON.stringify(msg));
+    handleMessage(msg);
+  };
+
+  ws.onerror = (e) => {
+    log('err', 'WebSocket 错误');
+    setStatus('error', '连接错误');
+  };
+
+  ws.onclose = () => {
+    log('info', 'WebSocket 已关闭');
+    if (mySessionId !== null) {
+      setStatus('disconnected', '连接已断开');
+      appendSys('⚠ 与服务器的连接已断开');
+    }
+    cleanup();
+  };
+}
+
+function doDisconnect() {
+  send({ type: 'disconnect' });
+  cleanup();
+  setStatus('disconnected', '已断开');
+  appendSys('— 已手动断开连接 —');
+}
+
+function cleanup() {
+  pc?.close();
+  localStream?.getTracks().forEach(t => t.stop());
+  if (ws && ws.readyState < 2) ws.close();
+  cancelAnimationFrame(levelRaf);
+
+  pc = null; localStream = null; ws = null; analyser = null; levelRaf = null;
+  mySessionId = null; myChannelId = 0;
+  isMuted = false; isDeafened = false;
+  channels = {}; users = {};
+
+  document.getElementById('levelBar').style.width = '0%';
+  document.getElementById('voiceStatus').innerHTML = '语音：<strong>未连接</strong>';
+  document.getElementById('channelList').innerHTML = '<div style="padding:8px 12px;color:var(--text-muted);font-size:12px;">连接后显示</div>';
+  document.getElementById('userList').innerHTML = '<div style="padding:8px 12px;color:var(--text-muted);font-size:12px;">暂无用户</div>';
+  setInputsEnabled(false);
+  updateMuteDeafenUI();
+
+  // Remove any injected audio elements
+  document.querySelectorAll('audio[data-mumdota]').forEach(el => el.remove());
+}
+
+// ── Message handling ───────────────────────────────────────────────────────
+async function handleMessage({ type, data }) {
+  switch (type) {
+
+    case 'connected':
+      mySessionId = data.session_id;
+      myChannelId = data.users.find(u => u.session_id === mySessionId)?.channel_id ?? 0;
+
+      channels = {};
+      data.channels.forEach(c => channels[c.id] = c);
+      users = {};
+      data.users.forEach(u => users[u.session_id] = u);
+
+      renderChannels();
+      renderUsers();
+      setInputsEnabled(true);
+      setStatus('connected', `已连接 · session ${mySessionId}`);
+      appendSys(`✓ 已加入服务器，session ${mySessionId}`);
+      log('info', `Connected: session=${mySessionId}`);
+
+      await setupWebRTC();
+      break;
+
+    case 'answer':
+      await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+      log('info', 'Remote description set (answer)');
+      break;
+
+    case 'ice_candidate':
+      try {
+        await pc.addIceCandidate({
+          candidate: data.candidate,
+          sdpMid: data.sdp_mid,
+          sdpMLineIndex: data.sdp_mline_index
+        });
+      } catch (e) { log('err', `addIceCandidate: ${e.message}`); }
+      break;
+
+    case 'user_joined':
+      users[data.session_id] = data;
+      renderUsers();
+      appendSys(`→ ${escHtml(data.name)} 加入了服务器`);
+      break;
+
+    case 'user_left': {
+      const name = users[data.session_id]?.name ?? `session ${data.session_id}`;
+      delete users[data.session_id];
+      renderUsers();
+      appendSys(`← ${escHtml(name)} 离开了服务器`);
+      break;
+    }
+
+    case 'user_state': {
+      const u = users[data.session_id];
+      if (!u) break;
+      if (data.channel_id != null) u.channel_id = data.channel_id;
+      if (data.name != null) u.name = data.name;
+      if (data.mute != null) u.mute = data.mute;
+      if (data.deaf != null) u.deaf = data.deaf;
+      if (data.self_mute != null) u.self_mute = data.self_mute;
+      if (data.self_deaf != null) u.self_deaf = data.self_deaf;
+      renderUsers();
+      break;
+    }
+
+    case 'channel_updated':
+      channels = {};
+      data.channels.forEach(c => channels[c.id] = c);
+      renderChannels();
+      break;
+
+    case 'chat_received':
+      appendChat(data.sender_name, data.sender_session, data.message, data.timestamp);
+      break;
+
+    case 'error':
+      appendSys(`⚠ 错误 [${escHtml(data.code)}]: ${escHtml(data.message)}`);
+      log('err', `Server error: ${data.code} — ${data.message}`);
+      break;
+  }
+}
+
+// ── WebRTC ─────────────────────────────────────────────────────────────────
+async function setupWebRTC() {
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+  pc.ontrack = (e) => {
+    log('info', `Remote track: kind=${e.track.kind}`);
+    const audio = document.createElement('audio');
+    audio.setAttribute('data-mumdota', '1');
+    audio.srcObject = e.streams[0];
+    audio.autoplay = true;
+    document.body.appendChild(audio);
+    audio.play().catch(() => {
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-primary';
+      btn.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999;font-size:16px;padding:16px 32px;';
+      btn.textContent = '🔊 点击开启语音（浏览器策略限制）';
+      btn.onclick = () => { audio.play(); btn.remove(); };
+      document.body.appendChild(btn);
+    });
+  };
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      send({
+        type: 'ice_candidate',
+        data: {
+          candidate: e.candidate.candidate,
+          sdp_mid: e.candidate.sdpMid,
+          sdp_mline_index: e.candidate.sdpMLineIndex
+        }
+      });
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    const state = pc?.iceConnectionState;
+    log('info', `ICE: ${state}`);
+    if (state === 'connected' || state === 'completed') {
+      document.getElementById('voiceStatus').innerHTML = '语音：<strong style="color:var(--green)">已连接 ✓</strong>';
+    } else if (state === 'disconnected' || state === 'failed') {
+      document.getElementById('voiceStatus').innerHTML = `语音：<strong style="color:var(--red)">${state}</strong>`;
+    } else {
+      document.getElementById('voiceStatus').innerHTML = `语音：<strong>${state}</strong>`;
+    }
+  };
+
+  // Prefer Opus
+  try {
+    const codecs = RTCRtpReceiver.getCapabilities?.('audio')?.codecs
+      ?.filter(c => c.mimeType.toLowerCase() === 'audio/opus') ?? [];
+    if (codecs.length) {
+      pc.getTransceivers()[0]?.setCodecPreferences?.(codecs);
+    }
+  } catch (_) {}
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  log('info', 'SDP offer created, sending…');
+  send({ type: 'offer', data: { sdp: offer.sdp } });
+}
+
+// ── Mute / Deafen ──────────────────────────────────────────────────────────
+function toggleMute() {
+  isMuted = !isMuted;
+  if (localStream) {
+    localStream.getAudioTracks().forEach(t => { t.enabled = !isMuted; });
+  }
+  send({ type: 'mute', data: { muted: isMuted } });
+  updateMuteDeafenUI();
+  appendSys(isMuted ? '🔇 已静音' : '🎤 已取消静音');
+}
+
+function toggleDeafen() {
+  isDeafened = !isDeafened;
+  document.querySelectorAll('audio[data-mumdota]').forEach(a => { a.muted = isDeafened; });
+  send({ type: 'deafen', data: { deafened: isDeafened } });
+  updateMuteDeafenUI();
+  appendSys(isDeafened ? '🔕 已屏蔽音频' : '🔊 已取消屏蔽');
+}
+
+function updateMuteDeafenUI() {
+  const mBtn = document.getElementById('btnMute');
+  const dBtn = document.getElementById('btnDeafen');
+  if (isMuted) {
+    mBtn.textContent = '🔇';
+    mBtn.classList.add('muted-red');
+    mBtn.classList.remove('active');
+    mBtn.title = '取消静音';
+  } else {
+    mBtn.textContent = '🎤';
+    mBtn.classList.remove('muted-red', 'active');
+    mBtn.title = '静音';
+  }
+  if (isDeafened) {
+    dBtn.textContent = '🔕';
+    dBtn.classList.add('muted-red');
+    dBtn.classList.remove('active');
+    dBtn.title = '取消屏蔽';
+  } else {
+    dBtn.textContent = '🔊';
+    dBtn.classList.remove('muted-red', 'active');
+    dBtn.title = '屏蔽音频';
+  }
+}
+
+// ── Chat ───────────────────────────────────────────────────────────────────
+function onChatKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendChat();
+  }
+}
+
+function sendChat() {
+  const input = document.getElementById('chatInput');
+  const msg = input.value.trim();
+  if (!msg || !ws) return;
+  send({ type: 'chat_send', data: { channel_id: myChannelId, message: msg } });
+  // Show own message locally
+  appendChat(
+    document.getElementById('nickInput').value.trim(),
+    mySessionId,
+    msg,
+    Math.floor(Date.now() / 1000),
+    true
+  );
+  input.value = '';
+  input.style.height = 'auto';
+}
+
+// ── Channel join ───────────────────────────────────────────────────────────
+function joinChannel(id) {
+  if (!ws) return;
+  send({ type: 'channel_join', data: { channel_id: id } });
+  myChannelId = id;
+  renderChannels();
+}
+
+// ── Render ─────────────────────────────────────────────────────────────────
+function renderChannels() {
+  const el = document.getElementById('channelList');
+  const sorted = Object.values(channels).sort((a, b) => a.id - b.id);
+  if (!sorted.length) {
+    el.innerHTML = '<div style="padding:8px 12px;color:var(--text-muted);font-size:12px;">无频道</div>';
+    return;
+  }
+  el.innerHTML = sorted.map(c => {
+    const active = c.id === myChannelId ? ' active' : '';
+    const usersInCh = Object.values(users).filter(u => u.channel_id === c.id).length;
+    const badge = usersInCh > 0 ? ` <span style="font-size:10px;color:var(--text-muted)">${usersInCh}</span>` : '';
+    return `<div class="channel-item${active}" onclick="joinChannel(${c.id})">
+      <span class="ch-icon">#</span>
+      <span class="ch-name">${escHtml(c.name)}</span>${badge}
+    </div>`;
+  }).join('');
+}
+
+function renderUsers() {
+  const el = document.getElementById('userList');
+  const list = Object.values(users).sort((a, b) => a.name.localeCompare(b.name));
+  if (!list.length) {
+    el.innerHTML = '<div style="padding:8px 12px;color:var(--text-muted);font-size:12px;">暂无用户</div>';
+    return;
+  }
+
+  const byChannel = {};
+  list.forEach(u => {
+    (byChannel[u.channel_id] = byChannel[u.channel_id] || []).push(u);
+  });
+
+  let html = '';
+  Object.entries(byChannel).forEach(([chId, usrs]) => {
+    const chName = channels[chId]?.name ?? `频道 ${chId}`;
+    html += `<div style="padding:4px 12px 2px;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:4px"># ${escHtml(chName)}</div>`;
+    usrs.forEach(u => {
+      const isMe = u.session_id === mySessionId;
+      const muted = u.self_mute || u.mute;
+      const deafened = u.self_deaf || u.deaf;
+      const badges = [
+        isMe ? '<span class="badge" title="自己">👤</span>' : '',
+        muted ? '<span class="badge" title="静音">🔇</span>' : '',
+        deafened ? '<span class="badge" title="屏蔽">🔕</span>' : '',
+        u.mute ? '<span class="badge" title="被服务器静音">🚫</span>' : ''
+      ].filter(Boolean).join('');
+      html += `<div class="user-item">
+        <div class="user-avatar">${escHtml(u.name[0].toUpperCase())}</div>
+        <div class="user-info">
+          <div class="user-name">${escHtml(u.name)}${isMe ? ' <span style="font-size:10px;color:var(--accent)">(我)</span>' : ''}</div>
+          ${badges ? `<div class="user-state">${badges}</div>` : ''}
+        </div>
+      </div>`;
+    });
+  });
+
+  el.innerHTML = html;
+}
+
+// ── Chat log ───────────────────────────────────────────────────────────────
+let lastSender = null;
+let lastTime = 0;
+
+function appendChat(sender, sessionId, text, timestamp, isSelf = false) {
+  const log = document.getElementById('chatLog');
+
+  // Remove empty state
+  const empty = log.querySelector('.empty');
+  if (empty) empty.remove();
+
+  const now = timestamp || Math.floor(Date.now() / 1000);
+  const timeStr = new Date(now * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+
+  const isGrouped = sender === lastSender && (now - lastTime) < 300;
+  lastSender = sender;
+  lastTime = now;
+
+  const color = isSelf ? 'var(--accent)' : stringToColor(sender);
+  const div = document.createElement('div');
+
+  if (isGrouped) {
+    div.className = 'msg';
+    div.innerHTML = `
+      <div class="msg-avatar" style="opacity:0;pointer-events:none">${escHtml(sender[0].toUpperCase())}</div>
+      <div class="msg-body">
+        <div class="msg-text">${linkify(escHtml(text))}</div>
+      </div>`;
+  } else {
+    div.className = 'msg';
+    div.innerHTML = `
+      <div class="msg-avatar" style="background:${color}22;color:${color};border:1px solid ${color}44">${escHtml(sender[0].toUpperCase())}</div>
+      <div class="msg-body">
+        <div class="msg-header">
+          <span class="msg-sender" style="color:${color}">${escHtml(sender)}</span>
+          <span class="msg-time">${timeStr}</span>
+        </div>
+        <div class="msg-text">${linkify(escHtml(text))}</div>
+      </div>`;
+  }
+
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendSys(text) {
+  const log = document.getElementById('chatLog');
+  const empty = log.querySelector('.empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'sys-msg';
+  div.innerHTML = escHtml(text);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  lastSender = null;
+}
+
+// ── Mic level meter ────────────────────────────────────────────────────────
+function startLevelMeter(stream) {
+  try {
+    const ctx = new AudioContext();
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    src.connect(analyser);
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    const bar = document.getElementById('levelBar');
+
+    function tick() {
+      levelRaf = requestAnimationFrame(tick);
+      if (isMuted) { bar.style.width = '0%'; return; }
+      analyser.getByteFrequencyData(buf);
+      const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
+      const pct = Math.min(100, avg * 2);
+      bar.style.width = pct + '%';
+      bar.style.background = pct > 70 ? 'var(--yellow)' : pct > 40 ? 'var(--green)' : 'var(--green)';
+    }
+    tick();
+  } catch (_) {}
+}
+
+// ── UI helpers ─────────────────────────────────────────────────────────────
+const btnConnect = document.getElementById('btnConnect');
+const btnDisconnect = document.getElementById('btnDisconnect');
+
+function setInputsEnabled(enabled) {
+  document.getElementById('chatInput').disabled = !enabled;
+  document.getElementById('btnSend').disabled = !enabled;
+  document.getElementById('btnMute').disabled = !enabled;
+  document.getElementById('btnDeafen').disabled = !enabled;
+  btnConnect.disabled = enabled;
+  btnDisconnect.disabled = !enabled;
+}
+
+function setStatus(state, text) {
+  const dot = document.getElementById('statusDot');
+  const span = document.getElementById('statusText');
+  dot.className = 'dot';
+  if (state === 'connected') dot.classList.add('green');
+  else if (state === 'connecting') dot.classList.add('yellow');
+  else if (state === 'error') dot.classList.add('red');
+  span.textContent = text;
+}
+
+// ── Debug log ──────────────────────────────────────────────────────────────
+let debugOpen = false;
+function toggleDebug() {
+  debugOpen = !debugOpen;
+  document.getElementById('debugPanel').classList.toggle('open', debugOpen);
+}
+
+function log(kind, text) {
+  const panel = document.getElementById('debugPanel');
+  const line = document.createElement('div');
+  line.className = `log-line ${kind}`;
+  const prefix = { tx: '→ TX', rx: '← RX', info: '   ', err: '✗  ' }[kind] || '';
+  const ts = new Date().toISOString().slice(11, 23);
+  line.textContent = `[${ts}] ${prefix} ${text}`;
+  panel.appendChild(line);
+  panel.scrollTop = panel.scrollHeight;
+  if (panel.children.length > 500) panel.removeChild(panel.firstChild);
+}
+
+// ── WS send ────────────────────────────────────────────────────────────────
+function send(msg) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const json = JSON.stringify(msg);
+  log('tx', json);
+  ws.send(json);
+}
+
+// ── Utilities ──────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function linkify(s) {
+  return s.replace(/(https?:\/\/[^\s<>"]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+}
+
+function stringToColor(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = str.charCodeAt(i) + ((h << 5) - h);
+  const hue = Math.abs(h) % 360;
+  return `hsl(${hue}, 65%, 65%)`;
+}
+
+// Auto-resize textarea
+document.getElementById('chatInput').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+</script>
+</body>
+</html>

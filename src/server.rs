@@ -19,10 +19,7 @@ pub struct AppState {
     pub config: Config,
 }
 
-async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| handle_ws_connection(socket, state.session_manager))
 }
 

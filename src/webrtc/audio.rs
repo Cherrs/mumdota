@@ -2,10 +2,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
-use webrtc::track::track_remote::TrackRemote;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_remote::TrackRemote;
 
 use bytes::Bytes;
 
@@ -45,41 +45,45 @@ pub fn setup_incoming_audio_handler(
         + Send
         + Sync,
 > {
-    Box::new(move |track: Arc<TrackRemote>, _receiver: Arc<RTCRtpReceiver>, _transceiver: Arc<RTCRtpTransceiver>| {
-        let tx = audio_tx.clone();
-        debug!(
-            "Incoming track: kind={}, codec={}",
-            track.kind(),
-            track.codec().capability.mime_type
-        );
+    Box::new(
+        move |track: Arc<TrackRemote>,
+              _receiver: Arc<RTCRtpReceiver>,
+              _transceiver: Arc<RTCRtpTransceiver>| {
+            let tx = audio_tx.clone();
+            debug!(
+                "Incoming track: kind={}, codec={}",
+                track.kind(),
+                track.codec().capability.mime_type
+            );
 
-        Box::pin(async move {
-            // Only handle audio tracks
-            if track.kind() != webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio {
-                return;
-            }
+            Box::pin(async move {
+                // Only handle audio tracks
+                if track.kind() != webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio {
+                    return;
+                }
 
-            tokio::spawn(async move {
-                loop {
-                    match track.read_rtp().await {
-                        Ok((rtp_packet, _attrs)) => {
-                            let packet = IncomingAudioPacket {
-                                opus_data: Bytes::from(rtp_packet.payload.to_vec()),
-                                seq_num: rtp_packet.header.sequence_number,
-                                timestamp: rtp_packet.header.timestamp,
-                            };
-                            if tx.send(packet).is_err() {
-                                debug!("Audio receiver closed");
+                tokio::spawn(async move {
+                    loop {
+                        match track.read_rtp().await {
+                            Ok((rtp_packet, _attrs)) => {
+                                let packet = IncomingAudioPacket {
+                                    opus_data: Bytes::from(rtp_packet.payload.to_vec()),
+                                    seq_num: rtp_packet.header.sequence_number,
+                                    timestamp: rtp_packet.header.timestamp,
+                                };
+                                if tx.send(packet).is_err() {
+                                    debug!("Audio receiver closed");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error reading RTP: {}", e);
                                 break;
                             }
                         }
-                        Err(e) => {
-                            error!("Error reading RTP: {}", e);
-                            break;
-                        }
                     }
-                }
-            });
-        })
-    })
+                });
+            })
+        },
+    )
 }

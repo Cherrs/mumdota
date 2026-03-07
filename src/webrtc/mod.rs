@@ -1,7 +1,7 @@
 pub mod audio;
 
-use std::sync::Arc;
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -123,8 +123,8 @@ impl WebrtcSession {
 
     /// Process an SDP offer from the browser and return an answer
     pub async fn handle_offer(&self, sdp_offer: &str) -> Result<String> {
-        let offer = RTCSessionDescription::offer(sdp_offer.to_string())
-            .context("Invalid SDP offer")?;
+        let offer =
+            RTCSessionDescription::offer(sdp_offer.to_string()).context("Invalid SDP offer")?;
 
         self.peer_connection
             .set_remote_description(offer)

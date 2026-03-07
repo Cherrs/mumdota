@@ -1,20 +1,367 @@
 # MumDota Frontend Integration Guide
 
-> Complete reference for integrating browser clients with the MumDota Mumble-to-WebRTC proxy.
+> 浏览器客户端接入 MumDota Mumble-to-WebRTC 代理的完整参考文档。
 
-## Quick Start
+## 连接地址
+
+```
+ws://<host>:8080/ws      WebSocket 信令连接
+http://<host>:8080/health  健康检查（返回 "ok"）
+```
+
+---
+
+## 消息格式
+
+所有消息均为 JSON，统一采用 **adjacently tagged** 格式：
+
+```json
+{"type": "<消息类型>", "data": { ...字段... }}
+```
+
+- `type` 字段值全部为 **snake_case**（小写加下划线）
+- 有内容的消息带 `"data"` 对象；无数据的消息（如 `disconnect`）只有 `"type"` 字段
+
+---
+
+## 连接流程
+
+```
+Browser                        MumDota Proxy                  Mumble Server
+  │                                │                               │
+  │──── WS Connect ────────────────│                               │
+  │──── connect ───────────────────│                               │
+  │                                │──── TCP+TLS Connect ──────────│
+  │                                │──── Authenticate ─────────────│
+  │                                │◄─── ServerSync ───────────────│
+  │◄─── connected ─────────────────│                               │
+  │                                │                               │
+  │──── offer (SDP) ───────────────│                               │
+  │◄─── answer (SDP) ──────────────│                               │
+  │◄──► ice_candidate ─────────────│                               │
+  │                                │                               │
+  │════ WebRTC Audio (Opus/RTP) ═══│════ Mumble Voice (Opus/UDP) ══│
+  │◄──► chat_send / chat_received ─│◄──► TextMessage ──────────────│
+```
+
+---
+
+## 客户端 → 服务器消息
+
+### connect
+
+连接并加入 Mumble 服务器。这是建立 WebSocket 后必须发送的第一条消息。
+
+```json
+{"type": "connect", "data": {"username": "PlayerOne"}}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `username` | string | 在 Mumble 中显示的用户名 |
+
+---
+
+### disconnect
+
+断开连接并释放资源。
+
+```json
+{"type": "disconnect"}
+```
+
+---
+
+### offer
+
+发送 WebRTC SDP Offer，在收到 `connected` 之后发送。
+
+```json
+{"type": "offer", "data": {"sdp": "<SDP 字符串>"}}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sdp` | string | RTCPeerConnection.createOffer() 生成的 SDP |
+
+---
+
+### ice_candidate
+
+发送 ICE 候选项。
+
+```json
+{
+  "type": "ice_candidate",
+  "data": {
+    "candidate": "candidate:...",
+    "sdp_mid": "0",
+    "sdp_mline_index": 0
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `candidate` | string | ICE candidate 字符串 |
+| `sdp_mid` | string \| null | SDP mid 值 |
+| `sdp_mline_index` | number \| null | SDP m-line 索引 |
+
+---
+
+### chat_send
+
+发送文字消息到指定频道。
+
+```json
+{"type": "chat_send", "data": {"channel_id": 0, "message": "Hello!"}}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `channel_id` | number | 目标频道 ID |
+| `message` | string | 消息内容 |
+
+---
+
+### channel_join
+
+切换到指定频道。
+
+```json
+{"type": "channel_join", "data": {"channel_id": 2}}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `channel_id` | number | 目标频道 ID |
+
+---
+
+### mute
+
+静音或取消静音自己的麦克风。
+
+```json
+{"type": "mute", "data": {"muted": true}}
+```
+
+---
+
+### deafen
+
+屏蔽或取消屏蔽接收音频。
+
+```json
+{"type": "deafen", "data": {"deafened": true}}
+```
+
+---
+
+## 服务器 → 客户端消息
+
+### connected
+
+登录成功后返回，包含当前频道列表和在线用户列表。
+
+```json
+{
+  "type": "connected",
+  "data": {
+    "session_id": 42,
+    "channels": [
+      {"id": 0, "name": "Root", "parent_id": 0, "description": ""},
+      {"id": 1, "name": "General", "parent_id": 0, "description": "默认频道"}
+    ],
+    "users": [
+      {
+        "session_id": 1,
+        "name": "Admin",
+        "channel_id": 0,
+        "mute": false,
+        "deaf": false,
+        "self_mute": false,
+        "self_deaf": false
+      }
+    ]
+  }
+}
+```
+
+收到后应立即发起 WebRTC `offer`。
+
+---
+
+### answer
+
+WebRTC SDP Answer，响应客户端的 `offer`。
+
+```json
+{"type": "answer", "data": {"sdp": "<SDP 字符串>"}}
+```
+
+收到后调用 `pc.setRemoteDescription({type: 'answer', sdp: data.sdp})`。
+
+---
+
+### ice_candidate
+
+服务器侧的 ICE 候选项。
+
+```json
+{
+  "type": "ice_candidate",
+  "data": {
+    "candidate": "candidate:...",
+    "sdp_mid": "0",
+    "sdp_mline_index": 0
+  }
+}
+```
+
+---
+
+### user_joined
+
+有新用户加入服务器。
+
+```json
+{
+  "type": "user_joined",
+  "data": {
+    "session_id": 5,
+    "name": "NewUser",
+    "channel_id": 1,
+    "mute": false,
+    "deaf": false,
+    "self_mute": false,
+    "self_deaf": false
+  }
+}
+```
+
+---
+
+### user_left
+
+有用户离开服务器。
+
+```json
+{"type": "user_left", "data": {"session_id": 5}}
+```
+
+---
+
+### user_state
+
+用户状态变更（静音、屏蔽、切换频道、改名）。只有发生变更的字段不为 null。
+
+```json
+{
+  "type": "user_state",
+  "data": {
+    "session_id": 5,
+    "channel_id": 2,
+    "name": null,
+    "mute": null,
+    "deaf": null,
+    "self_mute": true,
+    "self_deaf": null
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `session_id` | number | 发生变更的用户 |
+| `channel_id` | number \| null | 新频道（null 表示未变） |
+| `name` | string \| null | 新用户名（null 表示未变） |
+| `mute` | bool \| null | 服务器静音状态 |
+| `deaf` | bool \| null | 服务器屏蔽状态 |
+| `self_mute` | bool \| null | 用户自己静音 |
+| `self_deaf` | bool \| null | 用户自己屏蔽 |
+
+---
+
+### chat_received
+
+收到文字消息。
+
+```json
+{
+  "type": "chat_received",
+  "data": {
+    "sender_session": 5,
+    "sender_name": "OtherUser",
+    "channel_id": 1,
+    "message": "Hello!",
+    "timestamp": 1741276800
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sender_session` | number | 发送者的 session ID |
+| `sender_name` | string | 发送者用户名 |
+| `channel_id` | number | 频道 ID |
+| `message` | string | 消息内容 |
+| `timestamp` | number | Unix 时间戳（秒） |
+
+---
+
+### channel_updated
+
+频道列表变更（新建/删除频道时触发）。
+
+```json
+{
+  "type": "channel_updated",
+  "data": {
+    "channels": [
+      {"id": 0, "name": "Root", "parent_id": 0, "description": ""},
+      {"id": 1, "name": "General", "parent_id": 0, "description": ""}
+    ]
+  }
+}
+```
+
+---
+
+### error
+
+请求处理失败。
+
+```json
+{"type": "error", "data": {"code": "connect_failed", "message": "Connection refused"}}
+```
+
+| `code` 值 | 触发场景 |
+|-----------|---------|
+| `invalid_message` | 消息格式解析失败 |
+| `connect_failed` | 连接 Mumble 服务器失败 |
+| `offer_failed` | WebRTC offer 处理失败 |
+| `ice_failed` | ICE candidate 添加失败 |
+| `chat_failed` | 发送消息失败 |
+| `channel_join_failed` | 切换频道失败 |
+| `mute_failed` | 静音操作失败 |
+| `deafen_failed` | 屏蔽操作失败 |
+
+---
+
+## 完整示例代码
 
 ```html
 <!DOCTYPE html>
 <html>
 <head><title>MumDota Client</title></head>
 <body>
-  <input id="nick" placeholder="Nickname" value="WebUser" />
-  <button id="connect">Connect</button>
-  <button id="disconnect" disabled>Disconnect</button>
-  <div id="status">Disconnected</div>
+  <input id="nick" placeholder="用户名" value="WebUser" />
+  <button id="connect">连接</button>
+  <button id="disconnect" disabled>断开</button>
+  <div id="status">未连接</div>
   <div id="channels"></div>
-  <input id="chatInput" placeholder="Type a message..." disabled />
+  <input id="chatInput" placeholder="输入消息..." disabled />
   <div id="chatLog"></div>
 
   <script>
@@ -22,105 +369,127 @@
     const statusEl = document.getElementById('status');
 
     document.getElementById('connect').onclick = async () => {
-      const nick = document.getElementById('nick').value;
-      await startSession(nick);
+      await startSession(document.getElementById('nick').value);
     };
     document.getElementById('disconnect').onclick = () => {
-      ws?.send(JSON.stringify({ type: 'Disconnect' }));
+      ws?.send(JSON.stringify({type: 'disconnect'}));
       cleanup();
     };
 
-    async function startSession(nickname) {
-      // 1. Open WebSocket
-      ws = new WebSocket(`ws://${location.hostname}:3000/ws`);
+    async function startSession(username) {
+      ws = new WebSocket(`ws://${location.hostname}:8080/ws`);
       ws.onopen = () => {
-        statusEl.textContent = 'WebSocket connected, authenticating...';
-        ws.send(JSON.stringify({ type: 'Connect', nickname }));
+        statusEl.textContent = '已连接，正在验证...';
+        ws.send(JSON.stringify({type: 'connect', data: {username}}));
       };
       ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
-      ws.onclose = () => { statusEl.textContent = 'Disconnected'; cleanup(); };
+      ws.onclose = () => { statusEl.textContent = '已断开'; cleanup(); };
 
-      // 2. Get microphone
       localStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: {echoCancellation: true, noiseSuppression: true, sampleRate: 48000, channelCount: 1}
       });
     }
 
-    async function handleMessage(msg) {
-      switch (msg.type) {
-        case 'Connected':
-          statusEl.textContent = `Connected as "${msg.username}" (session ${msg.session_id})`;
+    async function handleMessage({type, data}) {
+      switch (type) {
+        case 'connected':
+          statusEl.textContent = `已连接，session ${data.session_id}`;
+          renderChannels(data.channels);
           document.getElementById('chatInput').disabled = false;
           document.getElementById('disconnect').disabled = false;
+          document.getElementById('connect').disabled = true;
           await setupWebRTC();
           break;
 
-        case 'SdpAnswer':
-          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+        case 'answer':
+          await pc.setRemoteDescription({type: 'answer', sdp: data.sdp});
           break;
 
-        case 'IceCandidate':
+        case 'ice_candidate':
           await pc.addIceCandidate({
-            candidate: msg.candidate,
-            sdpMid: msg.sdp_mid,
-            sdpMLineIndex: msg.sdp_mline_index
+            candidate: data.candidate,
+            sdpMid: data.sdp_mid,
+            sdpMLineIndex: data.sdp_mline_index
           });
           break;
 
-        case 'ChannelList':
-          renderChannels(msg.channels);
+        case 'channel_updated':
+          renderChannels(data.channels);
           break;
 
-        case 'UserList':
-          console.log('Users:', msg.users);
+        case 'user_joined':
+          console.log('用户加入:', data.name, 'session', data.session_id);
           break;
 
-        case 'ChatMessage':
-          appendChat(msg.sender, msg.message);
+        case 'user_left':
+          console.log('用户离开: session', data.session_id);
           break;
 
-        case 'Error':
-          statusEl.textContent = `Error: ${msg.message}`;
+        case 'user_state':
+          console.log('用户状态变更:', data);
           break;
 
-        case 'Disconnected':
-          statusEl.textContent = 'Disconnected from Mumble';
-          cleanup();
+        case 'chat_received':
+          appendChat(data.sender_name, data.message);
+          break;
+
+        case 'error':
+          statusEl.textContent = `错误 [${data.code}]: ${data.message}`;
           break;
       }
     }
 
     async function setupWebRTC() {
       pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
       });
 
-      // Add mic track
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
-      // Receive remote audio
       pc.ontrack = (e) => {
-        const audio = new Audio();
+        const audio = document.createElement('audio');
         audio.srcObject = e.streams[0];
-        audio.play();
+        audio.autoplay = true;
+        document.body.appendChild(audio);
+        audio.play().catch(() => {
+          const btn = document.createElement('button');
+          btn.textContent = '点击开启音频';
+          btn.onclick = () => { audio.play(); btn.remove(); };
+          document.body.appendChild(btn);
+        });
       };
 
-      // Send ICE candidates
       pc.onicecandidate = (e) => {
         if (e.candidate) {
           ws.send(JSON.stringify({
-            type: 'IceCandidate',
-            candidate: e.candidate.candidate,
-            sdp_mid: e.candidate.sdpMid,
-            sdp_mline_index: e.candidate.sdpMLineIndex
+            type: 'ice_candidate',
+            data: {
+              candidate: e.candidate.candidate,
+              sdp_mid: e.candidate.sdpMid,
+              sdp_mline_index: e.candidate.sdpMLineIndex
+            }
           }));
         }
       };
 
-      // Create and send offer
+      pc.oniceconnectionstatechange = () => {
+        console.log('ICE 状态:', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'connected') {
+          statusEl.textContent = '语音已连接';
+        }
+      };
+
+      // 限定使用 Opus 编解码器
+      const transceiver = pc.getTransceivers()[0];
+      if (transceiver?.setCodecPreferences) {
+        const codecs = RTCRtpReceiver.getCapabilities('audio').codecs
+          .filter(c => c.mimeType === 'audio/opus');
+        if (codecs.length) transceiver.setCodecPreferences(codecs);
+      }
+
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({ type: 'SdpOffer', sdp: offer.sdp }));
+      ws.send(JSON.stringify({type: 'offer', data: {sdp: offer.sdp}}));
     }
 
     function cleanup() {
@@ -130,13 +499,14 @@
       pc = null; localStream = null; ws = null;
       document.getElementById('chatInput').disabled = true;
       document.getElementById('disconnect').disabled = true;
+      document.getElementById('connect').disabled = false;
     }
 
     function renderChannels(channels) {
-      const el = document.getElementById('channels');
-      el.innerHTML = '<h3>Channels</h3>' + channels.map(c =>
-        `<div><button onclick="switchChannel(${c.id})">${c.name}</button></div>`
-      ).join('');
+      document.getElementById('channels').innerHTML =
+        '<h3>频道</h3>' + channels.map(c =>
+          `<div><button onclick="joinChannel(${c.id})">${c.name}</button></div>`
+        ).join('');
     }
 
     function appendChat(sender, message) {
@@ -145,16 +515,15 @@
       el.scrollTop = el.scrollHeight;
     }
 
-    window.switchChannel = (id) => {
-      ws.send(JSON.stringify({ type: 'SwitchChannel', channel_id: id }));
+    window.joinChannel = (id) => {
+      ws.send(JSON.stringify({type: 'channel_join', data: {channel_id: id}}));
     };
 
     document.getElementById('chatInput').onkeydown = (e) => {
       if (e.key === 'Enter' && e.target.value) {
         ws.send(JSON.stringify({
-          type: 'SendChat',
-          channel_id: 0,
-          message: e.target.value
+          type: 'chat_send',
+          data: {channel_id: 0, message: e.target.value}
         }));
         e.target.value = '';
       }
@@ -166,330 +535,8 @@
 
 ---
 
-## Connection Flow
+## 浏览器要求
 
-```
-Browser                          MumDota Proxy                    Mumble Server
-  │                                  │                                │
-  │──── WS Connect ──────────────────│                                │
-  │──── {"type":"Connect"} ──────────│                                │
-  │                                  │──── TCP+TLS Connect ───────────│
-  │                                  │──── Authenticate ──────────────│
-  │                                  │◄─── ServerSync ────────────────│
-  │◄─── {"type":"Connected"} ────────│                                │
-  │──── {"type":"SdpOffer"} ─────────│                                │
-  │◄─── {"type":"SdpAnswer"} ────────│                                │
-  │◄──► ICE Candidates ─────────────►│                                │
-  │                                  │                                │
-  │════ WebRTC Media (Opus/RTP) ═════│════ Mumble Voice (Opus) ═══════│
-  │◄──► Chat Messages ──────────────►│◄──► TextMessage ──────────────►│
-```
-
----
-
-## WebSocket Protocol Reference
-
-All messages are JSON over WebSocket at `ws://<host>:3000/ws`.
-
-### Client → Server Messages
-
-#### Connect
-Authenticate and join the Mumble server.
-```json
-{ "type": "Connect", "nickname": "PlayerOne" }
-```
-
-#### Disconnect
-Leave the Mumble server and clean up resources.
-```json
-{ "type": "Disconnect" }
-```
-
-#### SdpOffer
-Send a WebRTC SDP offer to establish media connection.
-```json
-{ "type": "SdpOffer", "sdp": "<SDP string>" }
-```
-
-#### IceCandidate
-Send an ICE candidate for WebRTC connectivity.
-```json
-{
-  "type": "IceCandidate",
-  "candidate": "candidate:...",
-  "sdp_mid": "0",
-  "sdp_mline_index": 0
-}
-```
-
-#### SwitchChannel
-Move to a different Mumble channel.
-```json
-{ "type": "SwitchChannel", "channel_id": 2 }
-```
-
-#### SendChat
-Send a text message. Use `channel_id: 0` for current channel.
-```json
-{ "type": "SendChat", "channel_id": 0, "message": "Hello everyone!" }
-```
-
-#### SetMute
-Mute or unmute your microphone.
-```json
-{ "type": "SetMute", "muted": true }
-```
-
-#### SetDeaf
-Deafen or undeafen (stop receiving audio).
-```json
-{ "type": "SetDeaf", "deafened": true }
-```
-
-### Server → Client Messages
-
-#### Connected
-Login successful. Returned after `Connect`.
-```json
-{
-  "type": "Connected",
-  "session_id": 42,
-  "username": "PlayerOne",
-  "channel_id": 0
-}
-```
-
-#### Disconnected
-Connection to Mumble ended (server kick, network error, or requested).
-```json
-{ "type": "Disconnected", "reason": "Server kicked you" }
-```
-
-#### SdpAnswer
-WebRTC SDP answer in response to `SdpOffer`.
-```json
-{ "type": "SdpAnswer", "sdp": "<SDP string>" }
-```
-
-#### IceCandidate
-ICE candidate from the server side.
-```json
-{
-  "type": "IceCandidate",
-  "candidate": "candidate:...",
-  "sdp_mid": "0",
-  "sdp_mline_index": 0
-}
-```
-
-#### ChannelList
-Current channel tree. Sent on login and when channels change.
-```json
-{
-  "type": "ChannelList",
-  "channels": [
-    { "id": 0, "name": "Root", "parent_id": 0, "description": "" },
-    { "id": 1, "name": "General", "parent_id": 0, "description": "Default channel" }
-  ]
-}
-```
-
-#### UserList
-Current user list. Sent on login and when users join/leave/move.
-```json
-{
-  "type": "UserList",
-  "users": [
-    { "session_id": 1, "name": "Admin", "channel_id": 0, "muted": false, "deafened": false }
-  ]
-}
-```
-
-#### ChatMessage
-Text message received from another user.
-```json
-{
-  "type": "ChatMessage",
-  "sender": "OtherUser",
-  "message": "Hello!",
-  "channel_id": 0
-}
-```
-
-#### UserStateChanged
-A user's state changed (mute, deaf, channel move).
-```json
-{
-  "type": "UserStateChanged",
-  "session_id": 1,
-  "channel_id": 2,
-  "muted": false,
-  "deafened": false
-}
-```
-
-#### Error
-An error occurred processing a request.
-```json
-{ "type": "Error", "message": "Not connected to Mumble server" }
-```
-
----
-
-## WebRTC Setup Details
-
-### Audio Constraints
-
-```javascript
-const constraints = {
-  audio: {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
-    sampleRate: 48000,
-    channelCount: 1
-  }
-};
-const stream = await navigator.mediaDevices.getUserMedia(constraints);
-```
-
-### PeerConnection Configuration
-
-```javascript
-const pc = new RTCPeerConnection({
-  iceServers: [
-    // Use your private STUN server for production
-    { urls: 'stun:your-stun-server:3478' },
-    // Public fallback (not recommended for production)
-    { urls: 'stun:stun.l.google.com:19302' }
-  ]
-});
-```
-
-### Codec Preference (Opus)
-
-The proxy only supports Opus. To ensure the browser prefers Opus:
-
-```javascript
-const transceiver = pc.getTransceivers()[0];
-if (transceiver && transceiver.setCodecPreferences) {
-  const codecs = RTCRtpReceiver.getCapabilities('audio').codecs
-    .filter(c => c.mimeType === 'audio/opus');
-  transceiver.setCodecPreferences(codecs);
-}
-```
-
-### Handling Remote Audio
-
-```javascript
-pc.ontrack = (event) => {
-  const audio = document.createElement('audio');
-  audio.srcObject = event.streams[0];
-  audio.autoplay = true;
-  // Audio elements must be triggered by user gesture in some browsers
-  document.body.appendChild(audio);
-  audio.play().catch(() => {
-    // Add a "click to unmute" button if autoplay is blocked
-    const btn = document.createElement('button');
-    btn.textContent = 'Click to hear audio';
-    btn.onclick = () => { audio.play(); btn.remove(); };
-    document.body.appendChild(btn);
-  });
-};
-```
-
----
-
-## Configuration
-
-The proxy reads `config.toml` from the working directory:
-
-```toml
-[mumble]
-host = "mumble.example.com"
-port = 64738
-
-[server]
-listen_port = 3000
-
-[webrtc]
-stun_servers = ["stun:stun.l.google.com:19302"]
-```
-
-| Field | Description | Default |
-|-------|-------------|---------|
-| `mumble.host` | Mumble server hostname/IP | `"localhost"` |
-| `mumble.port` | Mumble server port | `64738` |
-| `server.listen_port` | HTTP/WS listen port | `3000` |
-| `webrtc.stun_servers` | STUN server URLs for ICE | `["stun:stun.l.google.com:19302"]` |
-
----
-
-## Error Handling
-
-### WebSocket Reconnection
-
-```javascript
-function connectWithRetry(nickname, maxRetries = 5) {
-  let retries = 0;
-
-  function connect() {
-    const ws = new WebSocket(`ws://${location.hostname}:3000/ws`);
-
-    ws.onopen = () => {
-      retries = 0;
-      ws.send(JSON.stringify({ type: 'Connect', nickname }));
-    };
-
-    ws.onclose = (e) => {
-      if (retries < maxRetries) {
-        const delay = Math.min(1000 * Math.pow(2, retries), 30000);
-        retries++;
-        console.log(`Reconnecting in ${delay}ms (attempt ${retries}/${maxRetries})`);
-        setTimeout(connect, delay);
-      }
-    };
-
-    ws.onerror = (e) => console.error('WebSocket error:', e);
-
-    return ws;
-  }
-
-  return connect();
-}
-```
-
-### ICE Connection Monitoring
-
-```javascript
-pc.oniceconnectionstatechange = () => {
-  console.log('ICE state:', pc.iceConnectionState);
-  switch (pc.iceConnectionState) {
-    case 'connected':
-      statusEl.textContent = 'Voice connected';
-      break;
-    case 'disconnected':
-    case 'failed':
-      statusEl.textContent = 'Voice connection lost';
-      // Consider restarting ICE or reconnecting
-      break;
-  }
-};
-```
-
----
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/ws` | WebSocket | Main signaling connection |
-| `/health` | GET | Health check, returns `"ok"` |
-
----
-
-## Browser Requirements
-
-- Modern browser with WebRTC support (Chrome 70+, Firefox 63+, Safari 14+, Edge 79+)
-- HTTPS required in production for `getUserMedia()` (localhost exempt)
-- User gesture required before `getUserMedia()` and audio playback on most browsers
+- Chrome 70+ / Firefox 63+ / Safari 14+ / Edge 79+
+- 生产环境需要 HTTPS 才能使用 `getUserMedia()`（localhost 除外）
+- 音频播放需要用户手势触发（部分浏览器限制）

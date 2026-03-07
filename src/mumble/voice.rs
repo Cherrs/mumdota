@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use mumble_protocol::crypt::ClientCryptState;
 use mumble_protocol::voice::{VoicePacket, VoicePacketPayload};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -39,7 +39,12 @@ impl MumbleVoice {
         let (incoming_tx, voice_rx) = mpsc::unbounded_channel();
         let (voice_tx, outgoing_rx) = mpsc::unbounded_channel();
 
-        let udp_socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        let bind_addr: SocketAddr = if server_addr.is_ipv6() {
+            (Ipv6Addr::UNSPECIFIED, 0u16).into()
+        } else {
+            (Ipv4Addr::UNSPECIFIED, 0u16).into()
+        };
+        let udp_socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
 

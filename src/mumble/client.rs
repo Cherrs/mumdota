@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use mumble_protocol::control::{ClientControlCodec, ControlPacket};
+use mumble_protocol::control::{msgs, ClientControlCodec, ControlPacket};
 use mumble_protocol::crypt::{ClientCryptState, BLOCK_SIZE, KEY_SIZE};
 use mumble_protocol::Clientbound;
 use std::convert::TryInto;
@@ -229,6 +229,42 @@ fn crypt_state_from_message(
     Ok(ClientCryptState::new_from(key, client_nonce, server_nonce))
 }
 
+fn merge_user_state(existing: &UserInfo, msg: &msgs::UserState) -> UserInfo {
+    UserInfo {
+        session_id: existing.session_id,
+        name: if msg.has_name() {
+            msg.get_name().to_string()
+        } else {
+            existing.name.clone()
+        },
+        channel_id: if msg.has_channel_id() {
+            msg.get_channel_id()
+        } else {
+            existing.channel_id
+        },
+        mute: if msg.has_mute() {
+            msg.get_mute()
+        } else {
+            existing.mute
+        },
+        deaf: if msg.has_deaf() {
+            msg.get_deaf()
+        } else {
+            existing.deaf
+        },
+        self_mute: if msg.has_self_mute() {
+            msg.get_self_mute()
+        } else {
+            existing.self_mute
+        },
+        self_deaf: if msg.has_self_deaf() {
+            msg.get_self_deaf()
+        } else {
+            existing.self_deaf
+        },
+    }
+}
+
 fn handle_control_packet(
     packet: ControlPacket<Clientbound>,
     event_tx: &mpsc::UnboundedSender<MumbleEvent>,
@@ -311,7 +347,7 @@ fn handle_control_packet(
                         None
                     },
                 };
-                *existing = info;
+                *existing = merge_user_state(existing, msg.as_ref());
                 let _ = event_tx.send(MumbleEvent::UserStateChanged(state));
             } else {
                 users.push(info.clone());
@@ -380,9 +416,114 @@ fn handle_control_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mumble_protocol::control::msgs;
     use mumble_protocol::crypt::BLOCK_SIZE;
+    use std::env;
+    use std::net::{SocketAddr, ToSocketAddrs};
     use tokio::sync::{mpsc, oneshot};
+    use tokio::time::{timeout, Duration};
+
+    fn expect_event<T>(
+        event_rx: &mut mpsc::UnboundedReceiver<MumbleEvent>,
+        matcher: impl Fn(MumbleEvent) -> Option<T>,
+    ) -> T {
+        matcher(event_rx.try_recv().expect("expected event")).expect("unexpected event")
+    }
+
+    fn resolve_test_server_addr(addr: &str) -> Result<SocketAddr, String> {
+        addr.to_socket_addrs()
+            .map_err(|err| format!("Failed to resolve {addr}: {err}"))?
+            .next()
+            .ok_or_else(|| format!("Failed to resolve {addr}: no socket addresses returned"))
+    }
+
+    async fn wait_for_connected(
+        client: &mut MumbleClient,
+    ) -> (u32, Option<u32>, Vec<u32>) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match client.event_rx.recv().await {
+                    Some(MumbleEvent::Connected {
+                        session_id,
+                        channels,
+                        users,
+                    }) => {
+                        let current_channel_id = users
+                            .iter()
+                            .find(|user| user.session_id == session_id)
+                            .map(|user| user.channel_id);
+                        let channel_ids = channels.into_iter().map(|channel| channel.id).collect();
+                        break (session_id, current_channel_id, channel_ids);
+                    }
+                    Some(MumbleEvent::Disconnected(reason)) => {
+                        panic!("Mumble disconnected during smoke test: {reason}");
+                    }
+                    Some(_) => {}
+                    None => panic!("Mumble event stream closed before Connected"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for Mumble Connected event")
+    }
+
+    async fn wait_for_channel_join(
+        client: &mut MumbleClient,
+        session_id: u32,
+        target_channel_id: u32,
+        context: &str,
+    ) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match client.event_rx.recv().await {
+                    Some(MumbleEvent::UserStateChanged(state))
+                        if state.session_id == session_id
+                            && state.channel_id == Some(target_channel_id) =>
+                    {
+                        break;
+                    }
+                    Some(MumbleEvent::Disconnected(reason)) => {
+                        panic!("Mumble disconnected {context}: {reason}");
+                    }
+                    Some(_) => {}
+                    None => panic!("Mumble event stream closed {context}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for channel join confirmation");
+    }
+
+    async fn wait_for_chat_message(
+        client: &mut MumbleClient,
+        sender_session: u32,
+        target_channel_id: u32,
+        expected_message: &str,
+        context: &str,
+    ) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match client.event_rx.recv().await {
+                    Some(MumbleEvent::ChatMessage {
+                        sender_session: actor,
+                        channel_id,
+                        message,
+                    }) if actor == sender_session
+                        && channel_id == target_channel_id
+                        && message == expected_message =>
+                    {
+                        break;
+                    }
+                    Some(MumbleEvent::Disconnected(reason)) => {
+                        panic!("Mumble disconnected {context}: {reason}");
+                    }
+                    Some(_) => {}
+                    None => panic!("Mumble event stream closed {context}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for chat delivery");
+    }
 
     #[test]
     fn invalid_cryptsetup_disconnects_instead_of_panicking() {
@@ -422,5 +563,242 @@ mod tests {
             }
             other => panic!("expected disconnect event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn connected_user_channel_move_preserves_cached_user_details() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut crypt_state = None;
+        let mut crypt_tx = None;
+        let mut channels = Vec::new();
+        let mut users = vec![UserInfo {
+            session_id: 42,
+            name: "alice".to_string(),
+            channel_id: 1,
+            mute: true,
+            deaf: false,
+            self_mute: true,
+            self_deaf: false,
+        }];
+        let mut our_session_id = Some(42);
+        let mut connected = true;
+
+        let mut msg = msgs::UserState::new();
+        msg.set_session(42);
+        msg.set_channel_id(9);
+
+        let keep_running = handle_control_packet(
+            ControlPacket::UserState(Box::new(msg)),
+            &event_tx,
+            &mut crypt_state,
+            &mut crypt_tx,
+            &mut channels,
+            &mut users,
+            &mut our_session_id,
+            &mut connected,
+        );
+
+        assert!(keep_running);
+        let state = expect_event(&mut event_rx, |event| match event {
+            MumbleEvent::UserStateChanged(state) => Some(state),
+            _ => None,
+        });
+        assert_eq!(state.session_id, 42);
+        assert_eq!(state.channel_id, Some(9));
+        assert_eq!(state.name, None);
+        assert_eq!(state.mute, None);
+        assert_eq!(state.self_mute, None);
+
+        assert_eq!(users[0].session_id, 42);
+        assert_eq!(users[0].name, "alice");
+        assert_eq!(users[0].channel_id, 9);
+        assert!(users[0].mute);
+        assert!(users[0].self_mute);
+    }
+
+    #[test]
+    fn text_message_emits_chat_event_for_target_channel() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut crypt_state = None;
+        let mut crypt_tx = None;
+        let mut channels = Vec::new();
+        let mut users = Vec::new();
+        let mut our_session_id = Some(7);
+        let mut connected = true;
+
+        let mut msg = msgs::TextMessage::new();
+        msg.set_actor(7);
+        msg.mut_channel_id().push(12);
+        msg.set_message("hello from test".to_string());
+
+        let keep_running = handle_control_packet(
+            ControlPacket::TextMessage(Box::new(msg)),
+            &event_tx,
+            &mut crypt_state,
+            &mut crypt_tx,
+            &mut channels,
+            &mut users,
+            &mut our_session_id,
+            &mut connected,
+        );
+
+        assert!(keep_running);
+        let chat = expect_event(&mut event_rx, |event| match event {
+            MumbleEvent::ChatMessage {
+                sender_session,
+                channel_id,
+                message,
+            } => Some((sender_session, channel_id, message)),
+            _ => None,
+        });
+        assert_eq!(chat.0, 7);
+        assert_eq!(chat.1, 12);
+        assert_eq!(chat.2, "hello from test");
+    }
+
+    #[test]
+    fn resolve_test_server_addr_accepts_hostname_with_port() {
+        let addr = resolve_test_server_addr("localhost:64738")
+            .expect("localhost with port should resolve for smoke tests");
+
+        assert_eq!(addr.port(), 64738);
+    }
+
+    #[test]
+    fn resolve_test_server_addr_rejects_missing_port() {
+        let err = resolve_test_server_addr("localhost").expect_err("missing port should fail");
+
+        assert!(err.contains("Failed to resolve"));
+    }
+
+    // Opt-in smoke test env vars:
+    // - required: MUMDOTA_TEST_MUMBLE_ADDR, MUMDOTA_TEST_MUMBLE_HOST
+    // - optional: MUMDOTA_TEST_USERNAME, MUMDOTA_TEST_ALLOW_INVALID_CERTS,
+    //   MUMDOTA_TEST_CHANNEL_ID, MUMDOTA_TEST_VERIFY_CHAT_ECHO,
+    //   MUMDOTA_TEST_OBSERVER_USERNAME
+    #[tokio::test]
+    #[ignore = "requires a reachable Mumble server configured via MUMDOTA_TEST_MUMBLE_* env vars"]
+    async fn real_mumble_smoke_connects_joins_channel_and_sends_chat() {
+        let server_addr = resolve_test_server_addr(&read_env("MUMDOTA_TEST_MUMBLE_ADDR"))
+            .expect("MUMDOTA_TEST_MUMBLE_ADDR must resolve to a socket address");
+        let server_host = read_env("MUMDOTA_TEST_MUMBLE_HOST");
+        let username = env::var("MUMDOTA_TEST_USERNAME")
+            .unwrap_or_else(|_| format!("mumdota-test-{}", std::process::id()));
+        let observer_username = env::var("MUMDOTA_TEST_OBSERVER_USERNAME")
+            .unwrap_or_else(|_| format!("{username}-observer"));
+        let accept_invalid_certs = env::var("MUMDOTA_TEST_ALLOW_INVALID_CERTS")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        let target_channel_id = env::var("MUMDOTA_TEST_CHANNEL_ID")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<u32>()
+            .expect("MUMDOTA_TEST_CHANNEL_ID must be a u32");
+        let verify_chat_echo = env::var("MUMDOTA_TEST_VERIFY_CHAT_ECHO")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let message = format!(
+            "mumdota smoke {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+
+        let mut observer = MumbleClient::connect(
+            server_addr,
+            server_host.clone(),
+            observer_username,
+            accept_invalid_certs,
+        )
+        .await
+        .expect("observer should connect to the configured Mumble server");
+        let (observer_session_id, observer_channel_id, observer_channels) =
+            wait_for_connected(&mut observer).await;
+
+        assert!(
+            observer_channels.contains(&target_channel_id),
+            "target channel {target_channel_id} was not advertised to observer"
+        );
+
+        if observer_channel_id != Some(target_channel_id) {
+            observer
+                .send_command(MumbleCommand::JoinChannel {
+                    channel_id: target_channel_id,
+                })
+                .expect("observer join channel command should be accepted");
+            wait_for_channel_join(
+                &mut observer,
+                observer_session_id,
+                target_channel_id,
+                "while waiting for observer join",
+            )
+            .await;
+        }
+
+        let mut client =
+            MumbleClient::connect(server_addr, server_host, username, accept_invalid_certs)
+                .await
+                .expect("smoke test should connect to the configured Mumble server");
+
+        let (session_id, current_channel_id, channel_ids) = wait_for_connected(&mut client).await;
+
+        assert!(
+            channel_ids.contains(&target_channel_id),
+            "target channel {target_channel_id} was not advertised by the server"
+        );
+
+        client
+            .send_command(MumbleCommand::JoinChannel {
+                channel_id: target_channel_id,
+            })
+            .expect("join channel command should be accepted");
+
+        if current_channel_id != Some(target_channel_id) {
+            wait_for_channel_join(
+                &mut client,
+                session_id,
+                target_channel_id,
+                "after join request",
+            )
+            .await;
+        }
+
+        client
+            .send_command(MumbleCommand::SendChat {
+                channel_id: target_channel_id,
+                message: message.clone(),
+            })
+            .expect("chat command should be accepted");
+
+        wait_for_chat_message(
+            &mut observer,
+            session_id,
+            target_channel_id,
+            &message,
+            "while waiting for observer chat delivery",
+        )
+        .await;
+
+        if verify_chat_echo {
+            wait_for_chat_message(
+                &mut client,
+                session_id,
+                target_channel_id,
+                &message,
+                "while waiting for sender chat echo",
+            )
+            .await;
+        }
+
+        client
+            .send_command(MumbleCommand::Disconnect)
+            .expect("disconnect command should be accepted");
+        observer
+            .send_command(MumbleCommand::Disconnect)
+            .expect("observer disconnect command should be accepted");
+    }
+
+    fn read_env(name: &str) -> String {
+        env::var(name).unwrap_or_else(|_| panic!("{name} must be set for the smoke test"))
     }
 }

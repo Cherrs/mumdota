@@ -106,7 +106,7 @@ impl SessionManager {
         // Create WebRTC session
         let webrtc_session = WebrtcSession::new(&self.config.webrtc)
             .await
-            .map_err(|e| format!("WebRTC setup failed: {}", e))?;
+            .map_err(|e| format!("WebRTC setup failed: {:#}", e))?;
 
         let session = Arc::new(Mutex::new(UserSession {
             mumble_client,
@@ -390,8 +390,10 @@ impl SessionManager {
                 }
                 event = webrtc_event_rx.recv() => {
                     match event {
-                        Some(WebrtcEvent::IceCandidate(candidate)) => {
-                            let _ = ws_tx.send(ServerMessage::IceCandidate(candidate));
+                        Some(WebrtcEvent::IceCandidate(_)) => {
+                            // Candidates are already embedded in the answer SDP (vanilla ICE);
+                            // sending them individually would arrive before the answer and
+                            // cause addIceCandidate to fail on the client.
                         }
                         Some(WebrtcEvent::ConnectionStateChanged(state)) => {
                             if state == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed

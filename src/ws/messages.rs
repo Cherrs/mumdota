@@ -157,7 +157,10 @@ impl ServerMessage {
 
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
-            format!(r#"{{"type":"error","data":{{"code":"serialize_error","message":"{}"}}}}"#, e)
+            format!(
+                r#"{{"type":"error","data":{{"code":"serialize_error","message":"{}"}}}}"#,
+                e
+            )
         })
     }
 }

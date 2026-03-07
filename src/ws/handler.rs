@@ -22,11 +22,7 @@ pub async fn handle_ws_connection(socket: WebSocket, session_manager: Arc<Sessio
     let send_task = tokio::spawn(async move {
         while let Some(msg) = ws_rx.recv().await {
             let json = msg.to_json();
-            if ws_sender
-                .send(Message::Text(json.into()))
-                .await
-                .is_err()
-            {
+            if ws_sender.send(Message::Text(json.into())).await.is_err() {
                 break;
             }
         }
@@ -47,13 +43,7 @@ pub async fn handle_ws_connection(socket: WebSocket, session_manager: Arc<Sessio
                 let text_str: &str = &text;
                 match serde_json::from_str::<ClientMessage>(text_str) {
                     Ok(client_msg) => {
-                        handle_client_message(
-                            &conn_id,
-                            client_msg,
-                            &session_manager,
-                            &ws_tx,
-                        )
-                        .await;
+                        handle_client_message(&conn_id, client_msg, &session_manager, &ws_tx).await;
                     }
                     Err(e) => {
                         warn!("Invalid message from {}: {}", conn_id, e);
@@ -108,9 +98,9 @@ async fn handle_client_message(
         ClientMessage::Offer(data) => {
             match session_manager.handle_offer(conn_id, &data.sdp).await {
                 Ok(answer_sdp) => {
-                    let _ = ws_tx.send(ServerMessage::Answer(
-                        crate::ws::messages::AnswerData { sdp: answer_sdp },
-                    ));
+                    let _ = ws_tx.send(ServerMessage::Answer(crate::ws::messages::AnswerData {
+                        sdp: answer_sdp,
+                    }));
                 }
                 Err(e) => {
                     let _ = ws_tx.send(ServerMessage::error("offer_failed", e));
@@ -119,12 +109,7 @@ async fn handle_client_message(
         }
         ClientMessage::IceCandidate(data) => {
             if let Err(e) = session_manager
-                .add_ice_candidate(
-                    conn_id,
-                    &data.candidate,
-                    data.sdp_mid,
-                    data.sdp_mline_index,
-                )
+                .add_ice_candidate(conn_id, &data.candidate, data.sdp_mid, data.sdp_mline_index)
                 .await
             {
                 let _ = ws_tx.send(ServerMessage::error("ice_failed", e));
@@ -139,10 +124,7 @@ async fn handle_client_message(
             }
         }
         ClientMessage::ChannelJoin(data) => {
-            if let Err(e) = session_manager
-                .join_channel(conn_id, data.channel_id)
-                .await
-            {
+            if let Err(e) = session_manager.join_channel(conn_id, data.channel_id).await {
                 let _ = ws_tx.send(ServerMessage::error("channel_join_failed", e));
             }
         }
