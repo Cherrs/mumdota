@@ -4,7 +4,7 @@ use tracing::{debug, error};
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_remote::TrackRemote;
 
 use bytes::Bytes;
@@ -19,8 +19,8 @@ pub struct IncomingAudioPacket {
 }
 
 /// Create an Opus audio track for sending audio to the browser
-pub fn create_opus_track(track_id: &str, stream_id: &str) -> Arc<TrackLocalStaticRTP> {
-    Arc::new(TrackLocalStaticRTP::new(
+pub fn create_opus_track(track_id: &str, stream_id: &str) -> Arc<TrackLocalStaticSample> {
+    Arc::new(TrackLocalStaticSample::new(
         RTCRtpCodecCapability {
             mime_type: "audio/opus".to_owned(),
             clock_rate: 48000,

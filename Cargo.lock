@@ -1221,6 +1221,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webrtc",
+ "webrtc-media",
 ]
 
 [[package]]

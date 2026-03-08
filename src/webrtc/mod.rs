@@ -14,7 +14,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
 use crate::config::WebrtcConfig;
@@ -32,7 +32,7 @@ pub enum WebrtcEvent {
 /// Manages a WebRTC PeerConnection for one user
 pub struct WebrtcSession {
     pub peer_connection: Arc<RTCPeerConnection>,
-    pub outgoing_track: Arc<TrackLocalStaticRTP>,
+    pub outgoing_track: Arc<TrackLocalStaticSample>,
     pub audio_rx: mpsc::UnboundedReceiver<IncomingAudioPacket>,
     pub event_rx: mpsc::UnboundedReceiver<WebrtcEvent>,
 }

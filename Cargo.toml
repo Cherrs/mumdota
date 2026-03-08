@@ -13,6 +13,7 @@ tower-http = { version = "0.5", features = ["cors"] }
 
 # WebRTC
 webrtc = "0.11"
+webrtc-media = "0.8"
 
 # Mumble protocol
 mumble-protocol = "0.4"
