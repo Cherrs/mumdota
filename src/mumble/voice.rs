@@ -139,14 +139,11 @@ impl MumbleVoice {
                     match packet {
                         Some(Ok((voice_packet, _src_addr))) => {
                             match voice_packet {
-                                VoicePacket::Ping { timestamp } => {
-                                    // Echo the ping back to keep the UDP channel alive
-                                    let pong = VoicePacket::Ping { timestamp };
-                                    if let Err(e) = sink.send((pong, server_addr)).await {
-                                        warn!("Failed to send voice pong: {}", e);
-                                    } else {
-                                        trace!("Voice ping replied");
-                                    }
+                                VoicePacket::Ping { .. } => {
+                                    // Server pings are server-echoed pongs of our client pings
+                                    // (RTT measurement). We do not reply to avoid corrupting
+                                    // the OCB2 nonce sequence.
+                                    trace!("Voice ping received");
                                 }
                                 VoicePacket::Audio {
                                     session_id,
