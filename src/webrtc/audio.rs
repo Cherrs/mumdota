@@ -67,7 +67,7 @@ pub fn setup_incoming_audio_handler(
                         match track.read_rtp().await {
                             Ok((rtp_packet, _attrs)) => {
                                 let packet = IncomingAudioPacket {
-                                    opus_data: Bytes::from(rtp_packet.payload.to_vec()),
+                                    opus_data: rtp_packet.payload,
                                     seq_num: rtp_packet.header.sequence_number,
                                     timestamp: rtp_packet.header.timestamp,
                                 };

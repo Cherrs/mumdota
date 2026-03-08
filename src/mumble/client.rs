@@ -3,6 +3,7 @@ use futures::{SinkExt, StreamExt};
 use mumble_protocol::control::{msgs, ClientControlCodec, ControlPacket};
 use mumble_protocol::crypt::{ClientCryptState, BLOCK_SIZE, KEY_SIZE};
 use mumble_protocol::Clientbound;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
@@ -111,8 +112,8 @@ impl MumbleClient {
 
             let mut crypt_state: Option<ClientCryptState> = None;
             let mut crypt_tx = Some(crypt_tx);
-            let mut channels: Vec<ChannelInfo> = Vec::new();
-            let mut users: Vec<UserInfo> = Vec::new();
+            let mut channels: HashMap<u32, ChannelInfo> = HashMap::new();
+            let mut users: HashMap<u32, UserInfo> = HashMap::new();
             let mut our_session_id: Option<u32> = None;
             let mut connected = false;
             let mut command_rx = command_rx;
@@ -270,8 +271,8 @@ fn handle_control_packet(
     event_tx: &mpsc::UnboundedSender<MumbleEvent>,
     crypt_state: &mut Option<ClientCryptState>,
     crypt_tx: &mut Option<oneshot::Sender<ClientCryptState>>,
-    channels: &mut Vec<ChannelInfo>,
-    users: &mut Vec<UserInfo>,
+    channels: &mut HashMap<u32, ChannelInfo>,
+    users: &mut HashMap<u32, UserInfo>,
     our_session_id: &mut Option<u32>,
     connected: &mut bool,
 ) -> bool {
@@ -283,19 +284,20 @@ fn handle_control_packet(
                 parent_id: msg.get_parent(),
                 description: msg.get_description().to_string(),
             };
+            let id = info.id;
             if !*connected {
-                channels.push(info);
-            } else if let Some(existing) = channels.iter_mut().find(|c| c.id == info.id) {
-                *existing = info.clone();
+                channels.insert(id, info);
+            } else if channels.contains_key(&id) {
+                channels.insert(id, info.clone());
                 let _ = event_tx.send(MumbleEvent::ChannelUpdated(info));
             } else {
-                channels.push(info.clone());
+                channels.insert(id, info.clone());
                 let _ = event_tx.send(MumbleEvent::ChannelAdded(info));
             }
         }
         ControlPacket::ChannelRemove(msg) => {
             let channel_id = msg.get_channel_id();
-            channels.retain(|c| c.id != channel_id);
+            channels.remove(&channel_id);
             if *connected {
                 let _ = event_tx.send(MumbleEvent::ChannelRemoved { channel_id });
             }
@@ -312,8 +314,8 @@ fn handle_control_packet(
                 self_deaf: msg.get_self_deaf(),
             };
             if !*connected {
-                users.push(info);
-            } else if let Some(existing) = users.iter_mut().find(|u| u.session_id == session_id) {
+                users.insert(session_id, info);
+            } else if let Some(existing) = users.get(&session_id) {
                 let state = UserStateData {
                     session_id,
                     channel_id: if msg.has_channel_id() {
@@ -347,16 +349,17 @@ fn handle_control_packet(
                         None
                     },
                 };
-                *existing = merge_user_state(existing, msg.as_ref());
+                let merged = merge_user_state(existing, msg.as_ref());
+                users.insert(session_id, merged);
                 let _ = event_tx.send(MumbleEvent::UserStateChanged(state));
             } else {
-                users.push(info.clone());
+                users.insert(session_id, info.clone());
                 let _ = event_tx.send(MumbleEvent::UserJoined(info));
             }
         }
         ControlPacket::UserRemove(msg) => {
             let session_id = msg.get_session();
-            users.retain(|u| u.session_id != session_id);
+            users.remove(&session_id);
             if *connected {
                 let _ = event_tx.send(MumbleEvent::UserLeft { session_id });
             }
@@ -385,8 +388,8 @@ fn handle_control_packet(
             }
             let _ = event_tx.send(MumbleEvent::Connected {
                 session_id,
-                channels: channels.clone(),
-                users: users.clone(),
+                channels: channels.values().cloned().collect(),
+                users: users.values().cloned().collect(),
             });
         }
         ControlPacket::TextMessage(msg) => {
@@ -531,8 +534,8 @@ mod tests {
         let (crypt_tx, _crypt_rx) = oneshot::channel();
         let mut crypt_state = None;
         let mut crypt_tx = Some(crypt_tx);
-        let mut channels = Vec::new();
-        let mut users = Vec::new();
+        let mut channels = HashMap::new();
+        let mut users = HashMap::new();
         let mut our_session_id = None;
         let mut connected = false;
 
@@ -570,8 +573,8 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let mut crypt_state = None;
         let mut crypt_tx = None;
-        let mut channels = Vec::new();
-        let mut users = vec![UserInfo {
+        let mut channels = HashMap::new();
+        let alice = UserInfo {
             session_id: 42,
             name: "alice".to_string(),
             channel_id: 1,
@@ -579,7 +582,8 @@ mod tests {
             deaf: false,
             self_mute: true,
             self_deaf: false,
-        }];
+        };
+        let mut users = HashMap::from([(42, alice)]);
         let mut our_session_id = Some(42);
         let mut connected = true;
 
@@ -609,11 +613,12 @@ mod tests {
         assert_eq!(state.mute, None);
         assert_eq!(state.self_mute, None);
 
-        assert_eq!(users[0].session_id, 42);
-        assert_eq!(users[0].name, "alice");
-        assert_eq!(users[0].channel_id, 9);
-        assert!(users[0].mute);
-        assert!(users[0].self_mute);
+        let user = &users[&42];
+        assert_eq!(user.session_id, 42);
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.channel_id, 9);
+        assert!(user.mute);
+        assert!(user.self_mute);
     }
 
     #[test]
@@ -621,8 +626,8 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let mut crypt_state = None;
         let mut crypt_tx = None;
-        let mut channels = Vec::new();
-        let mut users = Vec::new();
+        let mut channels = HashMap::new();
+        let mut users = HashMap::new();
         let mut our_session_id = Some(7);
         let mut connected = true;
 

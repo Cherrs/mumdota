@@ -100,8 +100,8 @@ impl AudioBridge {
     /// - `webrtc_audio_rx`: incoming Opus from browser via WebRTC
     /// - `webrtc_track`: outgoing Opus track to browser via WebRTC
     pub fn start(
-        mut mumble_voice_rx: mpsc::UnboundedReceiver<MumbleVoiceData>,
-        mumble_voice_tx: mpsc::UnboundedSender<WebrtcVoiceData>,
+        mut mumble_voice_rx: mpsc::Receiver<MumbleVoiceData>,
+        mumble_voice_tx: mpsc::Sender<WebrtcVoiceData>,
         mut webrtc_audio_rx: mpsc::UnboundedReceiver<IncomingAudioPacket>,
         webrtc_track: Arc<TrackLocalStaticSample>,
     ) -> Self {
@@ -176,9 +176,17 @@ impl AudioBridge {
                             opus_data: packet.opus_data,
                             last_frame: false,
                         };
-                        if mumble_voice_tx.send(voice_data).is_err() {
-                            debug!("Mumble voice tx closed");
-                            break;
+                        // Use try_send: drop packets rather than blocking
+                        // when the Mumble UDP sender can't keep up
+                        match mumble_voice_tx.try_send(voice_data) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("Mumble voice tx closed");
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!("Mumble voice buffer full, dropping outgoing packet");
+                            }
                         }
                     }
                     None => {

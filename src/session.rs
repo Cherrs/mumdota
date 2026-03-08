@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -69,6 +69,14 @@ impl SessionManager {
         self.sessions.read().await.len()
     }
 
+    async fn resolve_mumble_addr(&self) -> Result<SocketAddr, String> {
+        tokio::net::lookup_host(self.config.mumble_addr())
+            .await
+            .map_err(|e| format!("Failed to resolve Mumble server: {}", e))?
+            .next()
+            .ok_or_else(|| "Failed to resolve Mumble server address".to_string())
+    }
+
     /// Connect a new user to Mumble and set up WebRTC
     pub async fn connect_user(
         &self,
@@ -76,22 +84,19 @@ impl SessionManager {
         username: &str,
         ws_tx: mpsc::UnboundedSender<ServerMessage>,
     ) -> Result<(), String> {
-        if self.sessions.read().await.len() >= self.config.server.max_connections {
-            return Err("Server full".to_string());
+        // Single read lock for both checks
+        {
+            let sessions = self.sessions.read().await;
+            if sessions.len() >= self.config.server.max_connections {
+                return Err("Server full".to_string());
+            }
+            if sessions.contains_key(conn_id) {
+                return Err("Already connected".to_string());
+            }
         }
 
-        if self.sessions.read().await.contains_key(conn_id) {
-            return Err("Already connected".to_string());
-        }
-
-        // Resolve Mumble server address
-        let addr = self
-            .config
-            .mumble_addr()
-            .to_socket_addrs()
-            .map_err(|e| format!("Failed to resolve Mumble server: {}", e))?
-            .next()
-            .ok_or("Failed to resolve Mumble server address")?;
+        // Async DNS resolution — does not block tokio worker threads
+        let addr = self.resolve_mumble_addr().await?;
 
         // Connect to Mumble
         let mumble_client = MumbleClient::connect(
@@ -135,10 +140,19 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Look up a session by conn_id, cloning the Arc so the RwLock is released immediately.
+    async fn get_session(&self, conn_id: &str) -> Result<Arc<Mutex<UserSession>>, String> {
+        self.sessions
+            .read()
+            .await
+            .get(conn_id)
+            .cloned()
+            .ok_or_else(|| "Session not found".to_string())
+    }
+
     /// Handle SDP offer from browser
     pub async fn handle_offer(&self, conn_id: &str, sdp: &str) -> Result<String, String> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(conn_id).ok_or("Session not found")?;
+        let session = self.get_session(conn_id).await?;
         let session = session.lock().await;
         session
             .webrtc_session
@@ -155,8 +169,7 @@ impl SessionManager {
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u16>,
     ) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(conn_id).ok_or("Session not found")?;
+        let session = self.get_session(conn_id).await?;
         let session = session.lock().await;
         session
             .webrtc_session
@@ -172,8 +185,7 @@ impl SessionManager {
         channel_id: u32,
         message: &str,
     ) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(conn_id).ok_or("Session not found")?;
+        let session = self.get_session(conn_id).await?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -186,8 +198,7 @@ impl SessionManager {
 
     /// Join channel
     pub async fn join_channel(&self, conn_id: &str, channel_id: u32) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(conn_id).ok_or("Session not found")?;
+        let session = self.get_session(conn_id).await?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -197,8 +208,7 @@ impl SessionManager {
 
     /// Set mute state
     pub async fn set_mute(&self, conn_id: &str, muted: bool) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(conn_id).ok_or("Session not found")?;
+        let session = self.get_session(conn_id).await?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -208,8 +218,7 @@ impl SessionManager {
 
     /// Set deaf state
     pub async fn set_deaf(&self, conn_id: &str, deafened: bool) -> Result<(), String> {
-        let sessions = self.sessions.read().await;
-        let session = sessions.get(conn_id).ok_or("Session not found")?;
+        let session = self.get_session(conn_id).await?;
         let session = session.lock().await;
         session
             .mumble_client
@@ -257,9 +266,8 @@ impl SessionManager {
         let voice_setup_task = tokio::spawn(async move {
             match crypt_state_rx.await {
                 Ok(crypt_state) => {
-                    let addr = config_clone
-                        .mumble_addr()
-                        .to_socket_addrs()
+                    let addr = tokio::net::lookup_host(config_clone.mumble_addr())
+                        .await
                         .ok()
                         .and_then(|mut a| a.next());
 

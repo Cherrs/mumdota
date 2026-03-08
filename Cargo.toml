@@ -8,12 +8,12 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 
 # Web framework & WebSocket
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["cors"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 # WebRTC
-webrtc = "0.11"
-webrtc-media = "0.8"
+webrtc = "0.17"
+webrtc-media = "0.17"
 
 # Mumble protocol
 mumble-protocol = "0.4"
@@ -28,7 +28,7 @@ tokio-util = { version = "0.6", features = ["codec", "net"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 
 # Async utilities
 futures = "0.3"

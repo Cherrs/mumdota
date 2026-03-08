@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::udp::UdpFramed;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Incoming voice data from Mumble server
 #[derive(Debug)]
@@ -28,16 +28,20 @@ pub struct WebrtcVoiceData {
     pub last_frame: bool,
 }
 
+/// Bounded channel capacity for voice packets.
+/// At 20ms per Opus frame, 50 packets = 1 second of audio buffer.
+const VOICE_CHANNEL_CAPACITY: usize = 50;
+
 pub struct MumbleVoice {
     task: Option<JoinHandle<()>>,
-    voice_rx: Option<mpsc::UnboundedReceiver<MumbleVoiceData>>,
-    voice_tx: Option<mpsc::UnboundedSender<WebrtcVoiceData>>,
+    voice_rx: Option<mpsc::Receiver<MumbleVoiceData>>,
+    voice_tx: Option<mpsc::Sender<WebrtcVoiceData>>,
 }
 
 impl MumbleVoice {
     pub async fn start(server_addr: SocketAddr, crypt_state: ClientCryptState) -> Result<Self> {
-        let (incoming_tx, voice_rx) = mpsc::unbounded_channel();
-        let (voice_tx, outgoing_rx) = mpsc::unbounded_channel();
+        let (incoming_tx, voice_rx) = mpsc::channel(VOICE_CHANNEL_CAPACITY);
+        let (voice_tx, outgoing_rx) = mpsc::channel(VOICE_CHANNEL_CAPACITY);
 
         let bind_addr: SocketAddr = if server_addr.is_ipv6() {
             (Ipv6Addr::UNSPECIFIED, 0u16).into()
@@ -68,8 +72,8 @@ impl MumbleVoice {
     pub fn take_channels(
         &mut self,
     ) -> Result<(
-        mpsc::UnboundedReceiver<MumbleVoiceData>,
-        mpsc::UnboundedSender<WebrtcVoiceData>,
+        mpsc::Receiver<MumbleVoiceData>,
+        mpsc::Sender<WebrtcVoiceData>,
     )> {
         let voice_rx = self
             .voice_rx
@@ -95,8 +99,8 @@ impl MumbleVoice {
     #[cfg(test)]
     fn from_parts_for_test(
         task: JoinHandle<()>,
-        voice_rx: mpsc::UnboundedReceiver<MumbleVoiceData>,
-        voice_tx: mpsc::UnboundedSender<WebrtcVoiceData>,
+        voice_rx: mpsc::Receiver<MumbleVoiceData>,
+        voice_tx: mpsc::Sender<WebrtcVoiceData>,
     ) -> Self {
         Self {
             task: Some(task),
@@ -109,8 +113,8 @@ impl MumbleVoice {
         udp_socket: UdpSocket,
         server_addr: SocketAddr,
         crypt_state: ClientCryptState,
-        incoming_tx: mpsc::UnboundedSender<MumbleVoiceData>,
-        mut outgoing_rx: mpsc::UnboundedReceiver<WebrtcVoiceData>,
+        incoming_tx: mpsc::Sender<MumbleVoiceData>,
+        mut outgoing_rx: mpsc::Receiver<WebrtcVoiceData>,
     ) {
         let (mut sink, mut source) = UdpFramed::new(udp_socket, crypt_state).split();
 
@@ -135,9 +139,14 @@ impl MumbleVoice {
                     match packet {
                         Some(Ok((voice_packet, _src_addr))) => {
                             match voice_packet {
-                                VoicePacket::Ping { .. } => {
-                                    // Respond to voice pings
-                                    continue;
+                                VoicePacket::Ping { timestamp } => {
+                                    // Echo the ping back to keep the UDP channel alive
+                                    let pong = VoicePacket::Ping { timestamp };
+                                    if let Err(e) = sink.send((pong, server_addr)).await {
+                                        warn!("Failed to send voice pong: {}", e);
+                                    } else {
+                                        trace!("Voice ping replied");
+                                    }
                                 }
                                 VoicePacket::Audio {
                                     session_id,
@@ -146,12 +155,16 @@ impl MumbleVoice {
                                     ..
                                 } => {
                                     if let VoicePacketPayload::Opus(data, last) = payload {
-                                        let _ = incoming_tx.send(MumbleVoiceData {
+                                        // Use try_send to drop packets instead of blocking
+                                        // when the consumer can't keep up
+                                        if incoming_tx.try_send(MumbleVoiceData {
                                             session_id,
                                             seq_num,
                                             opus_data: data,
                                             last_frame: last,
-                                        });
+                                        }).is_err() {
+                                            trace!("Voice buffer full, dropping incoming packet");
+                                        }
                                     }
                                 }
                             }
@@ -221,8 +234,8 @@ mod tests {
             let _signal = DropSignal(Some(drop_tx));
             std::future::pending::<()>().await;
         });
-        let (_incoming_tx, voice_rx) = mpsc::unbounded_channel();
-        let (voice_tx, _outgoing_rx) = mpsc::unbounded_channel();
+        let (_incoming_tx, voice_rx) = mpsc::channel(1);
+        let (voice_tx, _outgoing_rx) = mpsc::channel(1);
         tokio::task::yield_now().await;
 
         let mut voice = MumbleVoice::from_parts_for_test(task, voice_rx, voice_tx);
