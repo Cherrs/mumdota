@@ -26,6 +26,8 @@ pub struct MumbleConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebrtcConfig {
     pub stun_servers: Vec<String>,
+    pub turn_username: Option<String>,
+    pub turn_credential: Option<String>,
 }
 
 /// Expand `${VAR}` and `${VAR:-default}` placeholders in a TOML string using
@@ -56,7 +58,10 @@ fn expand_env_vars(input: &str) -> anyhow::Result<String> {
                 (inner.as_str(), None)
             };
 
-            anyhow::ensure!(!var_name.is_empty(), "empty variable name in config placeholder");
+            anyhow::ensure!(
+                !var_name.is_empty(),
+                "empty variable name in config placeholder"
+            );
 
             match std::env::var(var_name) {
                 Ok(val) => output.push_str(&val),
@@ -131,10 +136,18 @@ fn apply_env_overrides(table: &mut toml::Table) {
 
     override_str!("server", "listen_addr", "MUMDOTA_SERVER_LISTEN_ADDR");
     override_int!("server", "listen_port", "MUMDOTA_SERVER_LISTEN_PORT");
-    override_int!("server", "max_connections", "MUMDOTA_SERVER_MAX_CONNECTIONS");
+    override_int!(
+        "server",
+        "max_connections",
+        "MUMDOTA_SERVER_MAX_CONNECTIONS"
+    );
     override_str!("mumble", "host", "MUMDOTA_MUMBLE_HOST");
     override_int!("mumble", "port", "MUMDOTA_MUMBLE_PORT");
-    override_bool!("mumble", "accept_invalid_certs", "MUMDOTA_MUMBLE_ACCEPT_INVALID_CERTS");
+    override_bool!(
+        "mumble",
+        "accept_invalid_certs",
+        "MUMDOTA_MUMBLE_ACCEPT_INVALID_CERTS"
+    );
 
     if let Ok(val) = std::env::var("MUMDOTA_WEBRTC_STUN_SERVERS") {
         let servers: Vec<Value> = val
@@ -148,6 +161,13 @@ fn apply_env_overrides(table: &mut toml::Table) {
             .unwrap()
             .insert("stun_servers".to_string(), Value::Array(servers));
     }
+
+    override_str!("webrtc", "turn_username", "MUMDOTA_WEBRTC_TURN_USERNAME");
+    override_str!(
+        "webrtc",
+        "turn_credential",
+        "MUMDOTA_WEBRTC_TURN_CREDENTIAL"
+    );
 }
 
 impl Config {
@@ -164,8 +184,7 @@ impl Config {
             toml::from_str(&expanded).context("failed to parse config TOML")?;
         apply_env_overrides(&mut table);
 
-        let config: Config =
-            table.try_into().context("failed to deserialize config")?;
+        let config: Config = table.try_into().context("failed to deserialize config")?;
         Ok(config)
     }
 

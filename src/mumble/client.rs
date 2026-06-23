@@ -439,9 +439,7 @@ mod tests {
             .ok_or_else(|| format!("Failed to resolve {addr}: no socket addresses returned"))
     }
 
-    async fn wait_for_connected(
-        client: &mut MumbleClient,
-    ) -> (u32, Option<u32>, Vec<u32>) {
+    async fn wait_for_connected(client: &mut MumbleClient) -> (u32, Option<u32>, Vec<u32>) {
         timeout(Duration::from_secs(10), async {
             loop {
                 match client.event_rx.recv().await {

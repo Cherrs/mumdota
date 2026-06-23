@@ -271,7 +271,8 @@ mod tests {
         let start = Instant::now();
 
         let _ = pacer.schedule(start, Duration::from_millis(20));
-        let scheduled = pacer.schedule(start + Duration::from_millis(80), Duration::from_millis(20));
+        let scheduled =
+            pacer.schedule(start + Duration::from_millis(80), Duration::from_millis(20));
 
         assert_eq!(scheduled, start + Duration::from_millis(80));
     }

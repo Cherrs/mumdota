@@ -57,6 +57,8 @@ impl WebrtcSession {
             .iter()
             .map(|url| RTCIceServer {
                 urls: vec![url.clone()],
+                username: config.turn_username.clone().unwrap_or_default(),
+                credential: config.turn_credential.clone().unwrap_or_default(),
                 ..Default::default()
             })
             .collect();
