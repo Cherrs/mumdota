@@ -133,8 +133,20 @@ impl MumbleVoice {
         }
         debug!("Initial UDP voice packet sent");
 
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+
         loop {
             tokio::select! {
+                _ = ping_interval.tick() => {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    let packet = VoicePacket::Ping { timestamp };
+                    if let Err(e) = sink.send((packet, server_addr)).await {
+                        warn!("Failed to send UDP ping packet: {}", e);
+                    }
+                }
                 packet = source.next() => {
                     match packet {
                         Some(Ok((voice_packet, _src_addr))) => {
