@@ -1,16 +1,40 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::bridge::AudioBridge;
 use crate::config::Config;
 use crate::mumble::{MumbleClient, MumbleCommand, MumbleEvent, MumbleVoice};
+use crate::turn::{
+    credentials::{IceConfig, IceServer},
+    TurnService,
+};
 use crate::webrtc::{WebrtcEvent, WebrtcSession};
 use crate::ws::messages::*;
 use tokio::sync::oneshot;
+
+fn session_ice_config(config: &Config, turn: Option<&TurnService>, conn_id: &str) -> IceConfig {
+    if let Some(turn) = turn {
+        return turn.ice_config(conn_id);
+    }
+    IceConfig {
+        ice_servers: config
+            .webrtc
+            .stun_servers
+            .iter()
+            .filter(|url| url.starts_with("stun:"))
+            .map(|url| IceServer {
+                urls: url.clone(),
+                username: None,
+                credential: None,
+            })
+            .collect(),
+        expires_at: None,
+    }
+}
 
 /// Represents a connected user's full session
 #[allow(dead_code)]
@@ -26,6 +50,8 @@ struct UserSession {
     slot: Option<OwnedSemaphorePermit>,
     closed: bool,
     close_notify: Arc<Notify>,
+    voice_start: Arc<Notify>,
+    known_speakers: HashSet<u32>,
 }
 
 fn abort_background_task(task: &mut Option<JoinHandle<()>>) {
@@ -69,6 +95,9 @@ pub struct SessionManager {
     sessions: Arc<Sessions>,
     slots: Arc<Semaphore>,
     config: Config,
+    api: OnceCell<crate::webrtc::MediaApi>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    turn: Option<Arc<TurnService>>,
 }
 
 impl SessionManager {
@@ -77,6 +106,62 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             slots: Arc::new(Semaphore::new(config.server.max_connections)),
             config,
+            api: OnceCell::new(),
+            shutdown: tokio::sync::watch::channel(false).0,
+            turn: None,
+        }
+    }
+
+    pub fn with_turn(mut self, turn: Option<Arc<TurnService>>) -> Self {
+        self.turn = turn;
+        self
+    }
+
+    pub async fn initialize_media(&self) -> anyhow::Result<&webrtc::api::API> {
+        Ok(&self
+            .api
+            .get_or_try_init(|| crate::webrtc::create_api(&self.config.webrtc))
+            .await?
+            .api)
+    }
+
+    pub fn ice_config(&self, conn_id: &str) -> IceConfig {
+        session_ice_config(&self.config, self.turn.as_deref(), conn_id)
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+    pub async fn stopping(&self) {
+        let mut shutdown = self.shutdown.subscribe();
+        let _ = shutdown.wait_for(|value| *value).await;
+    }
+    pub async fn close(&self) {
+        self.begin_shutdown();
+        let ids: Vec<_> = self.sessions.read().await.keys().cloned().collect();
+        for id in ids {
+            self.disconnect_user(&id).await;
+        }
+        if let Some(api) = self.api.get() {
+            api.close().await;
+        }
+    }
+
+    pub async fn refresh_ice(&self, conn_id: &str) -> Result<(), String> {
+        let session = self.get_session(conn_id).await?;
+        let session = session.lock().await;
+        if session.session_id.is_none() {
+            return Err("Mumble authentication pending".into());
+        }
+        let _ = session
+            .ws_tx
+            .send(ServerMessage::IceConfig(self.ice_config(conn_id)));
+        Ok(())
+    }
+
+    pub async fn revoke_turn(&self, conn_id: &str) {
+        if let Some(turn) = &self.turn {
+            turn.revoke(conn_id).await;
         }
     }
 
@@ -100,6 +185,9 @@ impl SessionManager {
         username: &str,
         ws_tx: mpsc::UnboundedSender<ServerMessage>,
     ) -> Result<(), String> {
+        if *self.shutdown.borrow() {
+            return Err("Server is shutting down".into());
+        }
         if self.sessions.read().await.contains_key(conn_id) {
             return Err("Already connected".to_string());
         }
@@ -115,17 +203,22 @@ impl SessionManager {
         let addr = self.resolve_mumble_addr().await?;
 
         // Connect to Mumble
-        let mumble_client = MumbleClient::connect(
-            addr,
-            self.config.mumble.host.clone(),
-            username.to_string(),
-            self.config.mumble.accept_invalid_certs,
+        let mumble_client = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MumbleClient::connect(
+                addr,
+                self.config.mumble.host.clone(),
+                username.to_string(),
+                self.config.mumble.accept_invalid_certs,
+            ),
         )
         .await
+        .map_err(|_| "Mumble connection timed out".to_string())?
         .map_err(|e| format!("Mumble connection failed: {}", e))?;
 
         // Create WebRTC session
-        let webrtc_session = WebrtcSession::new(&self.config.webrtc)
+        let api = self.initialize_media().await.map_err(|e| e.to_string())?;
+        let webrtc_session = WebrtcSession::new(api)
             .await
             .map_err(|e| format!("WebRTC setup failed: {:#}", e))?;
 
@@ -141,6 +234,8 @@ impl SessionManager {
             slot: Some(slot),
             closed: false,
             close_notify: Arc::new(Notify::new()),
+            voice_start: Arc::new(Notify::new()),
+            known_speakers: HashSet::new(),
         }));
 
         {
@@ -158,8 +253,9 @@ impl SessionManager {
         let conn_id_owned = conn_id.to_string();
         let config = self.config.clone();
         let sessions = self.sessions.clone();
+        let turn = self.turn.clone();
         tokio::spawn(async move {
-            Self::process_events(conn_id_owned, session, config, sessions).await;
+            Self::process_events(conn_id_owned, session, config, sessions, turn).await;
         });
 
         info!("User '{}' connecting (conn_id={})", username, conn_id);
@@ -176,15 +272,47 @@ impl SessionManager {
             .ok_or_else(|| "Session not found".to_string())
     }
 
-    /// Handle SDP offer from browser
-    pub async fn handle_offer(&self, conn_id: &str, sdp: &str) -> Result<String, String> {
+    pub async fn start_voice(&self, conn_id: &str, restart: bool) -> Result<(), String> {
         let session = self.get_session(conn_id).await?;
-        let session = session.lock().await;
-        session
+        let mut session = session.lock().await;
+        if session.session_id.is_none() {
+            return Err("Mumble authentication pending".into());
+        }
+        if !session.webrtc_session.started {
+            for speaker in &session.known_speakers {
+                session
+                    .webrtc_session
+                    .speakers
+                    .add(*speaker)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            session.webrtc_session.started = true;
+            session.voice_start.notify_one();
+        }
+        if let Some(sdp) = session
             .webrtc_session
-            .handle_offer(sdp)
+            .offer(restart)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?
+        {
+            let _ = session.ws_tx.send(ServerMessage::Offer(OfferData { sdp }));
+        }
+        Ok(())
+    }
+
+    pub async fn handle_answer(&self, conn_id: &str, sdp: &str) -> Result<(), String> {
+        let session = self.get_session(conn_id).await?;
+        let mut session = session.lock().await;
+        if let Some(sdp) = session
+            .webrtc_session
+            .answer(sdp)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            let _ = session.ws_tx.send(ServerMessage::Offer(OfferData { sdp }));
+        }
+        Ok(())
     }
 
     /// Add ICE candidate from browser
@@ -196,7 +324,7 @@ impl SessionManager {
         sdp_mline_index: Option<u16>,
     ) -> Result<(), String> {
         let session = self.get_session(conn_id).await?;
-        let session = session.lock().await;
+        let mut session = session.lock().await;
         session
             .webrtc_session
             .add_ice_candidate(candidate, sdp_mid, sdp_mline_index)
@@ -296,6 +424,7 @@ impl SessionManager {
         session: Arc<Mutex<UserSession>>,
         config: Config,
         sessions: Arc<Sessions>,
+        turn: Option<Arc<TurnService>>,
     ) {
         // Initialization and storing the task handle share the session lock with
         // teardown, so disconnect cannot race with spawning a new voice task.
@@ -323,9 +452,11 @@ impl SessionManager {
         let config_clone = config.clone();
         let conn_id_clone = conn_id.clone();
         let ws_tx_clone = ws_tx.clone();
+        let voice_start = s.voice_start.clone();
         let voice_setup_task = tokio::spawn(async move {
-            match crypt_state_rx.await {
-                Ok(crypt_state) => {
+            voice_start.notified().await;
+            match tokio::time::timeout(std::time::Duration::from_secs(10), crypt_state_rx).await {
+                Ok(Ok(crypt_state)) => {
                     let addr = tokio::net::lookup_host(config_clone.mumble_addr())
                         .await
                         .ok()
@@ -345,7 +476,7 @@ impl SessionManager {
                             let mut s = session_clone.lock().await;
                             let webrtc_audio_rx = std::mem::replace(
                                 &mut s.webrtc_session.audio_rx,
-                                mpsc::unbounded_channel().1,
+                                mpsc::channel(6).1,
                             );
                             match voice.take_channels() {
                                 Ok((voice_rx, voice_tx)) => {
@@ -353,7 +484,7 @@ impl SessionManager {
                                         voice_rx,
                                         voice_tx,
                                         webrtc_audio_rx,
-                                        s.webrtc_session.outgoing_track.clone(),
+                                        s.webrtc_session.speakers.clone(),
                                     );
                                     s.mumble_voice = Some(voice);
                                     s.bridge = Some(bridge);
@@ -378,8 +509,11 @@ impl SessionManager {
                         }
                     }
                 }
-                Err(_) => {
-                    warn!("CryptState channel closed before receiving state");
+                _ => {
+                    let _ = ws_tx_clone.send(ServerMessage::error(
+                        "voice_error",
+                        "Mumble voice encryption setup timed out or closed",
+                    ));
                 }
             }
         });
@@ -405,18 +539,33 @@ impl SessionManager {
                                     break;
                                 }
                                 s.session_id = Some(session_id);
+                                s.known_speakers = users.iter().map(|u| u.session_id).filter(|id| *id != session_id).collect();
                             }
                             let _ = ws_tx.send(ServerMessage::Connected(ConnectedData {
+                                protocol_version: 2,
+                                ice: session_ice_config(&config, turn.as_deref(), &conn_id),
                                 session_id,
                                 channels,
                                 users,
                             }));
                         }
                         Some(MumbleEvent::UserJoined(user)) => {
+                            let mut s = session.lock().await;
+                            if s.session_id != Some(user.session_id) {
+                                s.known_speakers.insert(user.session_id);
+                                if s.webrtc_session.started {
+                                    if let Err(error) = s.webrtc_session.speakers.add(user.session_id).await { let _ = ws_tx.send(ServerMessage::error("voice_error", error.to_string())); }
+                                }
+                            }
+                            drop(s);
                             user_map.insert(user.session_id, user.name.clone());
                             let _ = ws_tx.send(ServerMessage::UserJoined(user));
                         }
                         Some(MumbleEvent::UserLeft { session_id }) => {
+                            let mut s = session.lock().await;
+                            s.known_speakers.remove(&session_id);
+                            if let Err(error) = s.webrtc_session.speakers.remove(session_id).await { let _ = ws_tx.send(ServerMessage::error("voice_error", error.to_string())); }
+                            drop(s);
                             user_map.remove(&session_id);
                             let _ = ws_tx.send(ServerMessage::UserLeft(UserLeftData { session_id }));
                         }
@@ -463,6 +612,19 @@ impl SessionManager {
                 }
                 event = webrtc_event_rx.recv() => {
                     match event {
+                        Some(WebrtcEvent::IceCandidate(candidate)) => {
+                            let _ = ws_tx.send(ServerMessage::IceCandidate(IceCandidateData {
+                                candidate: candidate.candidate, sdp_mid: candidate.sdp_mid, sdp_mline_index: candidate.sdp_mline_index,
+                            }));
+                        }
+                        Some(WebrtcEvent::NegotiationNeeded) => {
+                            let mut s = session.lock().await;
+                            match s.webrtc_session.offer(false).await {
+                                Ok(Some(sdp)) => { let _ = ws_tx.send(ServerMessage::Offer(OfferData { sdp })); },
+                                Ok(None) => {},
+                                Err(error) => { let _ = ws_tx.send(ServerMessage::error("voice_error", error.to_string())); },
+                            }
+                        }
                         Some(WebrtcEvent::ConnectionStateChanged(state)) => {
                             if state == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed
                                 || state == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected
@@ -483,6 +645,9 @@ impl SessionManager {
         // Release capacity before telling the browser it can reconnect. If this
         // session was explicitly replaced, do not send a stale terminal error.
         Self::finish_session(&sessions, &conn_id, &session, terminal_error).await;
+        if let Some(turn) = turn {
+            turn.revoke(&conn_id).await;
+        }
     }
 }
 

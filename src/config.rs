@@ -7,6 +7,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub mumble: MumbleConfig,
     pub webrtc: WebrtcConfig,
+    #[serde(default)]
+    pub turn: TurnConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -14,6 +16,8 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub listen_port: u16,
     pub max_connections: usize,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,9 +29,52 @@ pub struct MumbleConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebrtcConfig {
+    #[serde(default)]
     pub stun_servers: Vec<String>,
-    pub turn_username: Option<String>,
-    pub turn_credential: Option<String>,
+    #[serde(default = "default_media_port")]
+    pub udp_port: u16,
+    #[serde(default)]
+    pub public_ip: Option<std::net::Ipv4Addr>,
+}
+
+fn default_media_port() -> u16 {
+    50000
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TurnConfig {
+    pub enabled: bool,
+    pub listen_addr: std::net::Ipv4Addr,
+    pub port: u16,
+    pub public_ip: Option<std::net::Ipv4Addr>,
+    pub public_host: String,
+    pub realm: String,
+    pub relay_min_port: u16,
+    pub relay_max_port: u16,
+    pub credential_ttl_secs: u64,
+    pub tls_port: u16,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: std::net::Ipv4Addr::UNSPECIFIED,
+            port: 3478,
+            public_ip: None,
+            public_host: String::new(),
+            realm: "mumdota".into(),
+            relay_min_port: 49160,
+            relay_max_port: 49999,
+            credential_ttl_secs: 3600,
+            tls_port: 5349,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
 }
 
 /// Expand `${VAR}` and `${VAR:-default}` placeholders in a TOML string using
@@ -162,12 +209,42 @@ fn apply_env_overrides(table: &mut toml::Table) {
             .insert("stun_servers".to_string(), Value::Array(servers));
     }
 
-    override_str!("webrtc", "turn_username", "MUMDOTA_WEBRTC_TURN_USERNAME");
-    override_str!(
-        "webrtc",
-        "turn_credential",
-        "MUMDOTA_WEBRTC_TURN_CREDENTIAL"
+    override_int!("webrtc", "udp_port", "MUMDOTA_WEBRTC_UDP_PORT");
+    override_str!("webrtc", "public_ip", "MUMDOTA_WEBRTC_PUBLIC_IP");
+    override_bool!("turn", "enabled", "MUMDOTA_TURN_ENABLED");
+    override_str!("turn", "listen_addr", "MUMDOTA_TURN_LISTEN_ADDR");
+    override_str!("turn", "public_ip", "MUMDOTA_TURN_PUBLIC_IP");
+    override_str!("turn", "public_host", "MUMDOTA_TURN_PUBLIC_HOST");
+    override_str!("turn", "realm", "MUMDOTA_TURN_REALM");
+    override_str!("turn", "tls_cert", "MUMDOTA_TURN_TLS_CERT");
+    override_str!("turn", "tls_key", "MUMDOTA_TURN_TLS_KEY");
+    override_int!("turn", "port", "MUMDOTA_TURN_PORT");
+    override_int!("turn", "tls_port", "MUMDOTA_TURN_TLS_PORT");
+    override_int!("turn", "relay_min_port", "MUMDOTA_TURN_RELAY_MIN_PORT");
+    override_int!("turn", "relay_max_port", "MUMDOTA_TURN_RELAY_MAX_PORT");
+    override_int!(
+        "turn",
+        "credential_ttl_secs",
+        "MUMDOTA_TURN_CREDENTIAL_TTL_SECS"
     );
+    if let Ok(origins) = std::env::var("MUMDOTA_SERVER_ALLOWED_ORIGINS") {
+        table
+            .entry("server")
+            .or_insert_with(|| Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "allowed_origins".into(),
+                Value::Array(
+                    origins
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| Value::String(s.into()))
+                        .collect(),
+                ),
+            );
+    }
 }
 
 impl Config {
@@ -185,7 +262,74 @@ impl Config {
         apply_env_overrides(&mut table);
 
         let config: Config = table.try_into().context("failed to deserialize config")?;
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.server.max_connections > 0,
+            "max_connections must be positive"
+        );
+        if self.turn.enabled {
+            let ip = self
+                .turn
+                .public_ip
+                .context("TURN requires turn.public_ip")?;
+            anyhow::ensure!(
+                !ip.is_unspecified() && !ip.is_multicast(),
+                "invalid TURN public IP"
+            );
+            anyhow::ensure!(
+                self.webrtc.public_ip == Some(ip),
+                "TURN and WebRTC public_ip must match"
+            );
+            anyhow::ensure!(
+                self.webrtc.udp_port != 0,
+                "TURN requires a fixed WebRTC udp_port"
+            );
+            anyhow::ensure!(
+                self.turn.port != 0
+                    && self.turn.port != self.webrtc.udp_port
+                    && self.turn.port != self.server.listen_port,
+                "TURN/media ports must be distinct and nonzero"
+            );
+            anyhow::ensure!(!self.turn.realm.is_empty(), "TURN realm is required");
+            anyhow::ensure!(
+                !self.turn.public_host.is_empty()
+                    && self
+                        .turn
+                        .public_host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+                "TURN public_host must be an IPv4 address or hostname"
+            );
+            anyhow::ensure!(
+                (300..=86400).contains(&self.turn.credential_ttl_secs),
+                "TURN credential TTL must be 300..86400 seconds"
+            );
+            let ports = self.turn.relay_min_port..=self.turn.relay_max_port;
+            anyhow::ensure!(
+                self.turn.relay_min_port > 0
+                    && self.turn.relay_min_port <= self.turn.relay_max_port
+                    && !ports.contains(&self.webrtc.udp_port)
+                    && !ports.contains(&self.turn.port),
+                "invalid or overlapping TURN relay port range"
+            );
+            anyhow::ensure!(
+                self.turn.tls_cert.is_some() == self.turn.tls_key.is_some(),
+                "TURN TLS requires both certificate and key"
+            );
+            if self.turn.tls_cert.is_some() {
+                anyhow::ensure!(
+                    self.turn.tls_port != 0
+                        && self.turn.tls_port != self.turn.port
+                        && self.turn.tls_port != self.server.listen_port,
+                    "TURN TLS port conflicts with another TCP listener"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn mumble_addr(&self) -> String {

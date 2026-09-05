@@ -1,542 +1,92 @@
-# MumDota Frontend Integration Guide
+# MumDota 浏览器协议 v2
 
-> 浏览器客户端接入 MumDota Mumble-to-WebRTC 代理的完整参考文档。
+网页可部署在 Cloudflare Workers。浏览器通过 `wss://voice.playdota2.win/ws` 直达 MumDota；媒体使用 WebRTC 直连，无法直连时使用同一 MumDota 进程内置的 TURN。无需 coturn 或其他 TURN 服务。
 
-## 连接地址
+v2 改为服务端发起 SDP offer。旧客户端发送 `offer` 会收到 `upgrade_required`，需要刷新并升级客户端。前后端应配套发布。
 
-```
-ws://<host>:8080/ws      WebSocket 信令连接
-http://<host>:8080/health  健康检查（返回 "ok"）
-```
+## 建立连接和语音
 
----
-
-## 消息格式
-
-所有消息均为 JSON，统一采用 **adjacently tagged** 格式：
+1. 打开 WebSocket 后 10 秒内发送 `connect`，用户名不能为空，最多 128 字节。
+2. 收到 `connected` 后，用 `data.ice.ice_servers` 创建 `RTCPeerConnection`。只读文字客户端可以跳过语音步骤。
+3. 用户允许麦克风后添加本地音轨，发送 `start_voice`。
+4. 收到服务端 `offer`，调用 `setRemoteDescription`、`createAnswer`、`setLocalDescription`，发送 `answer`。
+5. 双向交换 `ice_candidate`；远端 SDP 设置完成前先缓存候选。对 WebSocket 消息串行处理，避免异步 SDP 与候选处理发生竞争。
+6. 新用户加入会增加独立接收音轨，并由 MumDota 再次发送 offer。每位说话人的 stream ID 为 `mumble-stream-<session_id>`，分别播放，在浏览器中混音。
 
 ```json
-{"type": "<消息类型>", "data": { ...字段... }}
+{"type":"connect","data":{"username":"Player"}}
 ```
 
-- `type` 字段值全部为 **snake_case**（小写加下划线）
-- 有内容的消息带 `"data"` 对象；无数据的消息（如 `disconnect`）只有 `"type"` 字段
-
----
-
-## 连接流程
-
-```
-Browser                        MumDota Proxy                  Mumble Server
-  │                                │                               │
-  │──── WS Connect ────────────────│                               │
-  │──── connect ───────────────────│                               │
-  │                                │──── TCP+TLS Connect ──────────│
-  │                                │──── Authenticate ─────────────│
-  │                                │◄─── ServerSync ───────────────│
-  │◄─── connected ─────────────────│                               │
-  │                                │                               │
-  │──── offer (SDP) ───────────────│                               │
-  │◄─── answer (SDP) ──────────────│                               │
-  │◄──► ice_candidate ─────────────│                               │
-  │                                │                               │
-  │════ WebRTC Audio (Opus/RTP) ═══│════ Mumble Voice (Opus/UDP) ══│
-  │◄──► chat_send / chat_received ─│◄──► TextMessage ──────────────│
-```
-
----
-
-## 客户端 → 服务器消息
-
-### connect
-
-连接并加入 Mumble 服务器。这是建立 WebSocket 后必须发送的第一条消息。
-
-```json
-{"type": "connect", "data": {"username": "PlayerOne"}}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `username` | string | 在 Mumble 中显示的用户名 |
-
----
-
-### disconnect
-
-断开连接并释放资源。
-
-```json
-{"type": "disconnect"}
-```
-
----
-
-### offer
-
-发送 WebRTC SDP Offer，在收到 `connected` 之后发送。
-
-```json
-{"type": "offer", "data": {"sdp": "<SDP 字符串>"}}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `sdp` | string | RTCPeerConnection.createOffer() 生成的 SDP |
-
----
-
-### ice_candidate
-
-发送 ICE 候选项。
-
-```json
-{
-  "type": "ice_candidate",
-  "data": {
-    "candidate": "candidate:...",
-    "sdp_mid": "0",
-    "sdp_mline_index": 0
-  }
-}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `candidate` | string | ICE candidate 字符串 |
-| `sdp_mid` | string \| null | SDP mid 值 |
-| `sdp_mline_index` | number \| null | SDP m-line 索引 |
-
----
-
-### chat_send
-
-发送文字消息到指定频道。
-
-```json
-{"type": "chat_send", "data": {"channel_id": 0, "message": "Hello!"}}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `channel_id` | number | 目标频道 ID |
-| `message` | string | 消息内容 |
-
----
-
-### channel_join
-
-切换到指定频道。
-
-```json
-{"type": "channel_join", "data": {"channel_id": 2}}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `channel_id` | number | 目标频道 ID |
-
----
-
-### mute
-
-静音或取消静音自己的麦克风。
-
-```json
-{"type": "mute", "data": {"muted": true}}
-```
-
----
-
-### deafen
-
-屏蔽或取消屏蔽接收音频。
-
-```json
-{"type": "deafen", "data": {"deafened": true}}
-```
-
----
-
-## 服务器 → 客户端消息
-
-### connected
-
-登录成功后返回，包含当前频道列表和在线用户列表。
+`connected` 的数据示例（凭证仅为说明用途）：
 
 ```json
 {
   "type": "connected",
   "data": {
-    "session_id": 42,
-    "channels": [
-      {"id": 0, "name": "Root", "parent_id": 0, "description": ""},
-      {"id": 1, "name": "General", "parent_id": 0, "description": "默认频道"}
-    ],
-    "users": [
-      {
-        "session_id": 1,
-        "name": "Admin",
-        "channel_id": 0,
-        "mute": false,
-        "deaf": false,
-        "self_mute": false,
-        "self_deaf": false
-      }
-    ]
+    "protocol_version": 2,
+    "session_id": 1,
+    "channels": [{"id":0,"name":"Root","parent_id":0,"description":""}],
+    "users": [{"session_id":1,"name":"Player","channel_id":0,"mute":false,"deaf":false,"self_mute":false,"self_deaf":false}],
+    "ice": {
+      "ice_servers": [
+        {"urls":"stun:turn.playdota2.win:3478"},
+        {"urls":"turn:turn.playdota2.win:3478?transport=udp","username":"session-user","credential":"temporary-password"},
+        {"urls":"turn:turn.playdota2.win:3478?transport=tcp","username":"session-user","credential":"temporary-password"},
+        {"urls":"turns:turn.playdota2.win:5349?transport=tcp","username":"session-user","credential":"temporary-password"}
+      ],
+      "expires_at": 2000000000
+    }
   }
 }
 ```
 
-收到后应立即发起 WebRTC `offer`。
+`expires_at` 是 Unix 秒；无到期凭证时为 `null`。TLS 未配置时不会下发 `turns:`。TURN 凭证仅在成功登录 Mumble 后签发，并绑定当前 WebSocket 会话；不要写入日志、Worker 配置或浏览器持久存储。
 
----
+## 客户端消息
 
-### answer
+| type | data | 作用 |
+| --- | --- | --- |
+| `connect` | `{username}` | 登录 Mumble，必须是第一条文本消息 |
+| `disconnect` | 无 | 关闭会话和 WebSocket |
+| `start_voice` | 无 | 启动语音，等待服务端 offer |
+| `answer` | `{sdp}` | 回答服务端 offer |
+| `ice_candidate` | `{candidate,sdp_mid,sdp_mline_index}` | ICE 候选，后两项可为 `null` |
+| `ice_refresh` | 无 | 获取当前或即将轮换的会话凭证 |
+| `ice_restart` | 无 | 请求服务端发起 ICE restart |
+| `channel_join` | `{channel_id}` | 切换频道 |
+| `chat_send` | `{channel_id,message}` | 发送文字，最多 4096 字节 |
+| `mute` | `{muted}` | 设置静音 |
+| `deafen` | `{deafened}` | 设置耳聋 |
 
-WebRTC SDP Answer，响应客户端的 `offer`。
+## 服务端消息
 
-```json
-{"type": "answer", "data": {"sdp": "<SDP 字符串>"}}
-```
+| type | data |
+| --- | --- |
+| `connected` | 上面的登录结果 |
+| `offer` | `{sdp}` |
+| `ice_candidate` | `{candidate,sdp_mid,sdp_mline_index}` |
+| `ice_config` | `{ice_servers,expires_at}`，与登录结果中的 `ice` 相同结构 |
+| `channel_updated` | `{channels:[{id,name,parent_id,description}]}`，更新已知频道 |
+| `user_joined` | `{session_id,name,channel_id,mute,deaf,self_mute,self_deaf}` |
+| `user_left` | `{session_id}`，移除用户及对应音频元素 |
+| `user_state` | `{session_id,channel_id,name,mute,deaf,self_mute,self_deaf}`，可空字段只更新非空值 |
+| `chat_received` | `{sender_session,sender_name,message,channel_id,timestamp}`，时间为 Unix 秒 |
+| `error` | `{code,message}` |
 
-收到后调用 `pc.setRemoteDescription({type: 'answer', sdp: data.sdp})`。
+## 刷新和故障恢复
 
----
+在到期前约 60 秒发送 `ice_refresh`。收到 `ice_config` 后调用 `pc.setConfiguration({iceServers: data.ice_servers})`，再发送 `ice_restart`。服务端对协商排队，同一连接始终由服务端创建 offer，避免双方同时发起协商。默认凭证 TTL 为一小时，旧凭证保留到其原到期时间，使重启期间可以平滑切换。
 
-### ice_candidate
+ICE `disconnected` 等待约 3 秒，持续失败时刷新凭证并重启 ICE。重复的失败通知不能中断正在进行的重启。15 秒仍未成功时，关闭整个连接并重新登录 Mumble；应用客户端采用有上限的指数退避。
 
-服务器侧的 ICE 候选项。
+`mumble_disconnected`、`connect_failed` 是终止错误，后端随即关闭 WebSocket；客户端收到时立即清除旧的 connected 状态，无需等待 close 事件。`voice_error` 应重建会话，以便重新初始化 Mumble UDP 和协商。`upgrade_required` 要求刷新网页。
 
-```json
-{
-  "type": "ice_candidate",
-  "data": {
-    "candidate": "candidate:...",
-    "sdp_mid": "0",
-    "sdp_mline_index": 0
-  }
-}
-```
+所有 WebSocket 帧/消息限制为 128KiB。服务端每 15 秒发送 Ping；浏览器会自动回应 Pong。静默连接会在 45 秒后关闭。断开时撤销会话 TURN 凭证及其 allocations。
 
----
+## 部署验收
 
-### user_joined
+MumDota 固定媒体端口默认为 UDP 50000；内置 TURN 使用 UDP/TCP 3478 和可选 TLS/TCP 5349。公网 IP 和端口映射需要指向同一实例。TURN 域名使用 DNS-only，证书应匹配该域名；TURN TLS 不能接到普通 HTTP Ingress。
 
-有新用户加入服务器。
+`/health` 为进程存活；`/ready` 检查上游 TCP 可达性，不等价于端到端音频成功。应用中的“连接质量”使用实际选中的 ICE candidate pair 判断直连或 TURN，并展示传输协议、RTT、接收抖动与累计丢包率。
 
-```json
-{
-  "type": "user_joined",
-  "data": {
-    "session_id": 5,
-    "name": "NewUser",
-    "channel_id": 1,
-    "mute": false,
-    "deaf": false,
-    "self_mute": false,
-    "self_deaf": false
-  }
-}
-```
-
----
-
-### user_left
-
-有用户离开服务器。
-
-```json
-{"type": "user_left", "data": {"session_id": 5}}
-```
-
----
-
-### user_state
-
-用户状态变更（静音、屏蔽、切换频道、改名）。只有发生变更的字段不为 null。
-
-```json
-{
-  "type": "user_state",
-  "data": {
-    "session_id": 5,
-    "channel_id": 2,
-    "name": null,
-    "mute": null,
-    "deaf": null,
-    "self_mute": true,
-    "self_deaf": null
-  }
-}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `session_id` | number | 发生变更的用户 |
-| `channel_id` | number \| null | 新频道（null 表示未变） |
-| `name` | string \| null | 新用户名（null 表示未变） |
-| `mute` | bool \| null | 服务器静音状态 |
-| `deaf` | bool \| null | 服务器屏蔽状态 |
-| `self_mute` | bool \| null | 用户自己静音 |
-| `self_deaf` | bool \| null | 用户自己屏蔽 |
-
----
-
-### chat_received
-
-收到文字消息。
-
-```json
-{
-  "type": "chat_received",
-  "data": {
-    "sender_session": 5,
-    "sender_name": "OtherUser",
-    "channel_id": 1,
-    "message": "Hello!",
-    "timestamp": 1741276800
-  }
-}
-```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `sender_session` | number | 发送者的 session ID |
-| `sender_name` | string | 发送者用户名 |
-| `channel_id` | number | 频道 ID |
-| `message` | string | 消息内容 |
-| `timestamp` | number | Unix 时间戳（秒） |
-
----
-
-### channel_updated
-
-频道列表变更（新建/删除频道时触发）。
-
-```json
-{
-  "type": "channel_updated",
-  "data": {
-    "channels": [
-      {"id": 0, "name": "Root", "parent_id": 0, "description": ""},
-      {"id": 1, "name": "General", "parent_id": 0, "description": ""}
-    ]
-  }
-}
-```
-
----
-
-### error
-
-请求处理失败。
-
-```json
-{"type": "error", "data": {"code": "connect_failed", "message": "Connection refused"}}
-```
-
-| `code` 值 | 触发场景 |
-|-----------|---------|
-| `invalid_message` | 消息格式解析失败 |
-| `connect_failed` | 连接 Mumble 服务器失败 |
-| `offer_failed` | WebRTC offer 处理失败 |
-| `ice_failed` | ICE candidate 添加失败 |
-| `chat_failed` | 发送消息失败 |
-| `channel_join_failed` | 切换频道失败 |
-| `mute_failed` | 静音操作失败 |
-| `deafen_failed` | 屏蔽操作失败 |
-
----
-
-## 完整示例代码
-
-```html
-<!DOCTYPE html>
-<html>
-<head><title>MumDota Client</title></head>
-<body>
-  <input id="nick" placeholder="用户名" value="WebUser" />
-  <button id="connect">连接</button>
-  <button id="disconnect" disabled>断开</button>
-  <div id="status">未连接</div>
-  <div id="channels"></div>
-  <input id="chatInput" placeholder="输入消息..." disabled />
-  <div id="chatLog"></div>
-
-  <script>
-    let ws, pc, localStream;
-    const statusEl = document.getElementById('status');
-
-    document.getElementById('connect').onclick = async () => {
-      await startSession(document.getElementById('nick').value);
-    };
-    document.getElementById('disconnect').onclick = () => {
-      ws?.send(JSON.stringify({type: 'disconnect'}));
-      cleanup();
-    };
-
-    async function startSession(username) {
-      ws = new WebSocket(`ws://${location.hostname}:8080/ws`);
-      ws.onopen = () => {
-        statusEl.textContent = '已连接，正在验证...';
-        ws.send(JSON.stringify({type: 'connect', data: {username}}));
-      };
-      ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
-      ws.onclose = () => { statusEl.textContent = '已断开'; cleanup(); };
-
-      localStream = await navigator.mediaDevices.getUserMedia({
-        audio: {echoCancellation: true, noiseSuppression: true, sampleRate: 48000, channelCount: 1}
-      });
-    }
-
-    async function handleMessage({type, data}) {
-      switch (type) {
-        case 'connected':
-          statusEl.textContent = `已连接，session ${data.session_id}`;
-          renderChannels(data.channels);
-          document.getElementById('chatInput').disabled = false;
-          document.getElementById('disconnect').disabled = false;
-          document.getElementById('connect').disabled = true;
-          await setupWebRTC();
-          break;
-
-        case 'answer':
-          await pc.setRemoteDescription({type: 'answer', sdp: data.sdp});
-          break;
-
-        case 'ice_candidate':
-          await pc.addIceCandidate({
-            candidate: data.candidate,
-            sdpMid: data.sdp_mid,
-            sdpMLineIndex: data.sdp_mline_index
-          });
-          break;
-
-        case 'channel_updated':
-          renderChannels(data.channels);
-          break;
-
-        case 'user_joined':
-          console.log('用户加入:', data.name, 'session', data.session_id);
-          break;
-
-        case 'user_left':
-          console.log('用户离开: session', data.session_id);
-          break;
-
-        case 'user_state':
-          console.log('用户状态变更:', data);
-          break;
-
-        case 'chat_received':
-          appendChat(data.sender_name, data.message);
-          break;
-
-        case 'error':
-          statusEl.textContent = `错误 [${data.code}]: ${data.message}`;
-          break;
-      }
-    }
-
-    async function setupWebRTC() {
-      pc = new RTCPeerConnection({
-        iceServers: [{urls: 'stun:stun.l.google.com:19302'}]
-      });
-
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-      pc.ontrack = (e) => {
-        const audio = document.createElement('audio');
-        audio.srcObject = e.streams[0];
-        audio.autoplay = true;
-        document.body.appendChild(audio);
-        audio.play().catch(() => {
-          const btn = document.createElement('button');
-          btn.textContent = '点击开启音频';
-          btn.onclick = () => { audio.play(); btn.remove(); };
-          document.body.appendChild(btn);
-        });
-      };
-
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({
-            type: 'ice_candidate',
-            data: {
-              candidate: e.candidate.candidate,
-              sdp_mid: e.candidate.sdpMid,
-              sdp_mline_index: e.candidate.sdpMLineIndex
-            }
-          }));
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        console.log('ICE 状态:', pc.iceConnectionState);
-        if (pc.iceConnectionState === 'connected') {
-          statusEl.textContent = '语音已连接';
-        }
-      };
-
-      // 限定使用 Opus 编解码器
-      const transceiver = pc.getTransceivers()[0];
-      if (transceiver?.setCodecPreferences) {
-        const codecs = RTCRtpReceiver.getCapabilities('audio').codecs
-          .filter(c => c.mimeType === 'audio/opus');
-        if (codecs.length) transceiver.setCodecPreferences(codecs);
-      }
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({type: 'offer', data: {sdp: offer.sdp}}));
-    }
-
-    function cleanup() {
-      pc?.close();
-      localStream?.getTracks().forEach(t => t.stop());
-      ws?.close();
-      pc = null; localStream = null; ws = null;
-      document.getElementById('chatInput').disabled = true;
-      document.getElementById('disconnect').disabled = true;
-      document.getElementById('connect').disabled = false;
-    }
-
-    function renderChannels(channels) {
-      document.getElementById('channels').innerHTML =
-        '<h3>频道</h3>' + channels.map(c =>
-          `<div><button onclick="joinChannel(${c.id})">${c.name}</button></div>`
-        ).join('');
-    }
-
-    function appendChat(sender, message) {
-      const el = document.getElementById('chatLog');
-      el.innerHTML += `<div><b>${sender}:</b> ${message}</div>`;
-      el.scrollTop = el.scrollHeight;
-    }
-
-    window.joinChannel = (id) => {
-      ws.send(JSON.stringify({type: 'channel_join', data: {channel_id: id}}));
-    };
-
-    document.getElementById('chatInput').onkeydown = (e) => {
-      if (e.key === 'Enter' && e.target.value) {
-        ws.send(JSON.stringify({
-          type: 'chat_send',
-          data: {channel_id: 0, message: e.target.value}
-        }));
-        e.target.value = '';
-      }
-    };
-  </script>
-</body>
-</html>
-```
-
----
-
-## 浏览器要求
-
-- Chrome 70+ / Firefox 63+ / Safari 14+ / Edge 79+
-- 生产环境需要 HTTPS 才能使用 `getUserMedia()`（localhost 除外）
-- 音频播放需要用户手势触发（部分浏览器限制）
+同目录客户端 `client.html` 可作为诊断页。通过 HTTPS 提供该文件，附加 `?relay=1&turnTransport=udp`、`tcp` 或 `tls`，分别强制验证内置 TURN 的三种传输。完整应用实现位于 playdota2win 的 `src/lib/mumble/client.ts`，部署配置参见 MumDota README。

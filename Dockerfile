@@ -26,7 +26,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/mumdota /usr/local/bin/mumdota
 COPY config.toml ./config.toml
 
-EXPOSE 8080
+EXPOSE 8080/tcp 3478/udp 3478/tcp 5349/tcp 50000/udp
 
 ENTRYPOINT ["mumdota"]
 CMD ["config.toml"]

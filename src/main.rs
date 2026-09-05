@@ -3,6 +3,7 @@ mod config;
 mod mumble;
 mod server;
 mod session;
+mod turn;
 mod webrtc;
 mod ws;
 

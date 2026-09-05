@@ -1,0 +1,107 @@
+# Replace public IP, node label, hosts, TLS Secrets and image digest before use.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mumdota
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mumdota
+  namespace: mumdota
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mumdota
+  template:
+    metadata:
+      labels:
+        app: mumdota
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        mumdota-media: "true"
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: mumdota
+          image: ghcr.io/cherrs/mumdota:master # Pin the tested v2 image digest.
+          env:
+            - name: MUMDOTA_MUMBLE_HOST
+              value: m.playdota2.win
+            - name: MUMDOTA_WEBRTC_PUBLIC_IP
+              value: "203.0.113.10" # Public IPv4 of this selected node / its 1:1 NAT.
+            - name: MUMDOTA_WEBRTC_UDP_PORT
+              value: "50000"
+            - name: MUMDOTA_TURN_ENABLED
+              value: "true"
+            - name: MUMDOTA_TURN_PUBLIC_IP
+              value: "203.0.113.10"
+            - name: MUMDOTA_TURN_PUBLIC_HOST
+              value: turn.playdota2.win
+            - name: MUMDOTA_TURN_TLS_CERT
+              value: /etc/mumdota/tls/tls.crt
+            - name: MUMDOTA_TURN_TLS_KEY
+              value: /etc/mumdota/tls/tls.key
+            - name: MUMDOTA_SERVER_ALLOWED_ORIGINS
+              value: https://playdota2.win
+          ports:
+            - { name: http, containerPort: 8080, protocol: TCP }
+            - { name: media, containerPort: 50000, protocol: UDP }
+            - { name: turn-udp, containerPort: 3478, protocol: UDP }
+            - { name: turn-tcp, containerPort: 3478, protocol: TCP }
+            - { name: turn-tls, containerPort: 5349, protocol: TCP }
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "2", memory: "1Gi" }
+          volumeMounts:
+            - name: turn-tls
+              mountPath: /etc/mumdota/tls
+              readOnly: true
+      volumes:
+        - name: turn-tls
+          secret:
+            secretName: mumdota-turn-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mumdota
+  namespace: mumdota
+spec:
+  selector:
+    app: mumdota
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mumdota
+  namespace: mumdota
+spec:
+  # Set ingressClassName and controller-specific WebSocket timeouts as needed.
+  tls:
+    - hosts: [voice.playdota2.win]
+      secretName: mumdota-wss-tls
+  rules:
+    - host: voice.playdota2.win
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mumdota
+                port:
+                  number: 8080

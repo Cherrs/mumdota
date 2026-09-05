@@ -12,6 +12,7 @@ fn config(addr: SocketAddr, max_connections: usize) -> Config {
             listen_addr: "127.0.0.1".into(),
             listen_port: 0,
             max_connections,
+            allowed_origins: vec![],
         },
         mumble: MumbleConfig {
             host: addr.ip().to_string(),
@@ -20,9 +21,10 @@ fn config(addr: SocketAddr, max_connections: usize) -> Config {
         },
         webrtc: WebrtcConfig {
             stun_servers: vec![],
-            turn_username: None,
-            turn_credential: None,
+            udp_port: 0,
+            public_ip: None,
         },
+        turn: Default::default(),
     }
 }
 
