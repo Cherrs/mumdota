@@ -14,3 +14,16 @@ accept_invalid_certs = true
 
 [webrtc]
 stun_servers = []
+udp_port = 50000
+# For public deployments, set MUMDOTA_WEBRTC_PUBLIC_IP to the node public IPv4.
+
+[turn]
+enabled = false
+# Enable with MUMDOTA_TURN_ENABLED=true, MUMDOTA_TURN_PUBLIC_IP and
+# MUMDOTA_TURN_PUBLIC_HOST. WebRTC and TURN public IPv4 addresses must match.
+port = 3478
+relay_min_port = 49160
+relay_max_port = 49999
+credential_ttl_secs = 3600
+tls_port = 5349
+# Set MUMDOTA_TURN_TLS_CERT and MUMDOTA_TURN_TLS_KEY to enable TLS.

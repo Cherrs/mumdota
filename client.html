@@ -411,6 +411,34 @@
 // ── State ──────────────────────────────────────────────────────────────────
 let ws = null;
 let pc = null;
+let iceServers = [];
+let protocolVersion = 1;
+let messageQueue = Promise.resolve();
+let pendingCandidates = [];
+let iceRefreshTimer = null;
+let voiceTimer = null;
+let recoveryTimer = null;
+
+function voiceDeadline() {
+  clearTimeout(voiceTimer);
+  voiceTimer = setTimeout(() => {
+    cleanup();
+    setStatus('error', '连接超时，请重新连接');
+  }, 15000);
+}
+function applyIceConfig(ice) {
+  iceServers = ice.ice_servers;
+  // Diagnostic options: force relay, and isolate one listener for deployment QA.
+  const transport = new URLSearchParams(location.search).get('turnTransport');
+  if (transport) iceServers = iceServers.filter(server =>
+    transport === 'tls' ? server.urls.startsWith('turns:') :
+      server.urls.startsWith('turn:') && server.urls.includes(`transport=${transport}`));
+  pc?.setConfiguration({ iceServers });
+  clearTimeout(iceRefreshTimer);
+  if (ice.expires_at != null) iceRefreshTimer = setTimeout(() => {
+    send({ type: 'ice_refresh' }); voiceDeadline();
+  }, Math.max(1000, ice.expires_at * 1000 - Date.now() - 60000));
+}
 let localStream = null;
 let analyser = null;
 let levelRaf = null;
@@ -444,9 +472,12 @@ async function doConnect() {
 
   startLevelMeter(localStream);
 
-  const wsUrl = `ws://${server}/ws`;
+  const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${server}/ws`;
   log('info', `WS → ${wsUrl}`);
   ws = new WebSocket(wsUrl);
+  const currentSocket = ws;
+  messageQueue = Promise.resolve();
+  voiceDeadline();
 
   ws.onopen = () => {
     setStatus('connecting', '已握手，等待 Mumble 认证…');
@@ -454,9 +485,13 @@ async function doConnect() {
   };
 
   ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    log('rx', JSON.stringify(msg));
-    handleMessage(msg);
+    messageQueue = messageQueue.then(async () => {
+      if (ws !== currentSocket) return;
+      const msg = JSON.parse(e.data);
+      // Never copy temporary TURN passwords into the debug log.
+      log('rx', msg.type);
+      await handleMessage(msg);
+    }).catch(error => { log('err', error.message); cleanup(); setStatus('error', '语音协商失败，请重新连接'); });
   };
 
   ws.onerror = (e) => {
@@ -482,6 +517,10 @@ function doDisconnect() {
 }
 
 function cleanup() {
+  clearTimeout(iceRefreshTimer); clearTimeout(voiceTimer); clearTimeout(recoveryTimer);
+  iceRefreshTimer = voiceTimer = recoveryTimer = null;
+  pendingCandidates = [];
+  if (ws) ws.onclose = ws.onmessage = ws.onerror = ws.onopen = null;
   pc?.close();
   localStream?.getTracks().forEach(t => t.stop());
   if (ws && ws.readyState < 2) ws.close();
@@ -508,6 +547,8 @@ async function handleMessage({ type, data }) {
   switch (type) {
 
     case 'connected':
+      protocolVersion = data.protocol_version ?? 1;
+      if (data.ice) applyIceConfig(data.ice);
       mySessionId = data.session_id;
       myChannelId = data.users.find(u => u.session_id === mySessionId)?.channel_id ?? 0;
 
@@ -526,20 +567,30 @@ async function handleMessage({ type, data }) {
       await setupWebRTC();
       break;
 
+    case 'ice_config':
+      applyIceConfig(data);
+      if (pc) { send({ type: 'ice_restart' }); voiceDeadline(); }
+      break;
+    case 'offer': {
+      await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+      for (const candidate of pendingCandidates.splice(0)) await pc.addIceCandidate(candidate);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'answer', data: { sdp: answer.sdp } });
+      break;
+    }
     case 'answer':
       await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
-      log('info', 'Remote description set (answer)');
+      for (const candidate of pendingCandidates.splice(0)) await pc.addIceCandidate(candidate);
       break;
-
-    case 'ice_candidate':
-      try {
-        await pc.addIceCandidate({
-          candidate: data.candidate,
-          sdpMid: data.sdp_mid,
-          sdpMLineIndex: data.sdp_mline_index
-        });
-      } catch (e) { log('err', `addIceCandidate: ${e.message}`); }
+    case 'ice_candidate': {
+      const candidate = { candidate: data.candidate, sdpMid: data.sdp_mid, sdpMLineIndex: data.sdp_mline_index };
+      if (!pc?.remoteDescription) {
+        if (pendingCandidates.length >= 128) throw new Error('Too many ICE candidates');
+        pendingCandidates.push(candidate);
+      } else await pc.addIceCandidate(candidate);
       break;
+    }
 
     case 'user_joined':
       users[data.session_id] = data;
@@ -550,6 +601,9 @@ async function handleMessage({ type, data }) {
     case 'user_left': {
       const name = users[data.session_id]?.name ?? `session ${data.session_id}`;
       delete users[data.session_id];
+      document.querySelectorAll('audio[data-mumdota]').forEach(audio => {
+        if (audio.srcObject?.id === `mumble-stream-${data.session_id}`) { audio.pause(); audio.srcObject = null; audio.remove(); }
+      });
       renderUsers();
       appendSys(`← ${escHtml(name)} 离开了服务器`);
       break;
@@ -579,6 +633,7 @@ async function handleMessage({ type, data }) {
       break;
 
     case 'error':
+      if (['mumble_disconnected', 'connect_failed', 'upgrade_required', 'voice_error'].includes(data.code)) { cleanup(); setStatus('error', data.message); }
       appendSys(`⚠ 错误 [${escHtml(data.code)}]: ${escHtml(data.message)}`);
       log('err', `Server error: ${data.code} — ${data.message}`);
       break;
@@ -588,13 +643,15 @@ async function handleMessage({ type, data }) {
 // ── WebRTC ─────────────────────────────────────────────────────────────────
 async function setupWebRTC() {
   pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    iceServers,
+    iceTransportPolicy: new URLSearchParams(location.search).get('relay') === '1' ? 'relay' : 'all'
   });
 
   localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
   pc.ontrack = (e) => {
     log('info', `Remote track: kind=${e.track.kind}`);
+    if ([...document.querySelectorAll('audio[data-mumdota]')].some(audio => audio.srcObject === e.streams[0])) return;
     const audio = document.createElement('audio');
     audio.setAttribute('data-mumdota', '1');
     audio.srcObject = e.streams[0];
@@ -627,8 +684,11 @@ async function setupWebRTC() {
     const state = pc?.iceConnectionState;
     log('info', `ICE: ${state}`);
     if (state === 'connected' || state === 'completed') {
+      clearTimeout(voiceTimer); clearTimeout(recoveryTimer);
+      voiceTimer = recoveryTimer = null;
       document.getElementById('voiceStatus').innerHTML = '语音：<strong style="color:var(--green)">已连接 ✓</strong>';
     } else if (state === 'disconnected' || state === 'failed') {
+      if (protocolVersion >= 2 && !recoveryTimer) recoveryTimer = setTimeout(() => { recoveryTimer = null; send({ type: 'ice_refresh' }); voiceDeadline(); }, state === 'failed' ? 0 : 3000);
       document.getElementById('voiceStatus').innerHTML = `语音：<strong style="color:var(--red)">${state}</strong>`;
     } else {
       document.getElementById('voiceStatus').innerHTML = `语音：<strong>${state}</strong>`;
@@ -644,6 +704,8 @@ async function setupWebRTC() {
     }
   } catch (_) {}
 
+  voiceDeadline();
+  if (protocolVersion >= 2) { send({ type: 'start_voice' }); return; }
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   log('info', 'SDP offer created, sending…');

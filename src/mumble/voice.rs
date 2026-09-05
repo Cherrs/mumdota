@@ -18,6 +18,7 @@ pub struct MumbleVoiceData {
     pub seq_num: u64,
     pub opus_data: Bytes,
     pub last_frame: bool,
+    pub received_at: std::time::Instant,
 }
 
 /// Outgoing voice data to Mumble server
@@ -29,8 +30,8 @@ pub struct WebrtcVoiceData {
 }
 
 /// Bounded channel capacity for voice packets.
-/// At 20ms per Opus frame, 50 packets = 1 second of audio buffer.
-const VOICE_CHANNEL_CAPACITY: usize = 50;
+/// Accept simultaneous speaker bursts; the bridge drops packets older than 120ms.
+const VOICE_CHANNEL_CAPACITY: usize = 128;
 
 pub struct MumbleVoice {
     task: Option<JoinHandle<()>>,
@@ -41,7 +42,7 @@ pub struct MumbleVoice {
 impl MumbleVoice {
     pub async fn start(server_addr: SocketAddr, crypt_state: ClientCryptState) -> Result<Self> {
         let (incoming_tx, voice_rx) = mpsc::channel(VOICE_CHANNEL_CAPACITY);
-        let (voice_tx, outgoing_rx) = mpsc::channel(VOICE_CHANNEL_CAPACITY);
+        let (voice_tx, outgoing_rx) = mpsc::channel(6);
 
         let bind_addr: SocketAddr = if server_addr.is_ipv6() {
             (Ipv6Addr::UNSPECIFIED, 0u16).into()
@@ -118,15 +119,8 @@ impl MumbleVoice {
     ) {
         let (mut sink, mut source) = UdpFramed::new(udp_socket, crypt_state).split();
 
-        // Send an initial dummy packet to make the server accept our UDP
-        let init_packet = VoicePacket::Audio {
-            _dst: std::marker::PhantomData,
-            target: 0,
-            session_id: (),
-            seq_num: 0,
-            payload: VoicePacketPayload::Opus(Bytes::from_static(&[0u8; 16]), true),
-            position_info: None,
-        };
+        // Authenticate the UDP endpoint without injecting invalid Opus audio.
+        let init_packet = VoicePacket::Ping { timestamp: 0 };
         if let Err(e) = sink.send((init_packet, server_addr)).await {
             error!("Failed to send initial UDP packet: {}", e);
             return;
@@ -171,6 +165,7 @@ impl MumbleVoice {
                                             seq_num,
                                             opus_data: data,
                                             last_frame: last,
+                                            received_at: std::time::Instant::now(),
                                         }).is_err() {
                                             trace!("Voice buffer full, dropping incoming packet");
                                         }

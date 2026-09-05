@@ -1,34 +1,16 @@
+use crate::mumble::voice::{MumbleVoiceData, WebrtcVoiceData};
+use crate::webrtc::{audio::IncomingAudioPacket, speakers::SpeakerTracks};
 use anyhow::{anyhow, bail, Result};
 use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::sync::mpsc;
-use tokio::time::{sleep_until, Duration, Instant};
+use tokio::task::JoinHandle;
+use tokio::time::Duration;
 use tracing::{debug, warn};
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use webrtc_media::Sample;
-
-use crate::mumble::voice::{MumbleVoiceData, WebrtcVoiceData};
-use crate::webrtc::audio::IncomingAudioPacket;
 
 const OPUS_SAMPLE_RATE: u32 = 48_000;
 const MAX_OPUS_PACKET_SAMPLES: u32 = (OPUS_SAMPLE_RATE / 1000) * 120;
 
-#[derive(Default)]
-struct SendPacer {
-    next_send_at: Option<Instant>,
-}
-
-impl SendPacer {
-    fn schedule(&mut self, now: Instant, packet_duration: Duration) -> Instant {
-        let send_at = match self.next_send_at {
-            Some(next_send_at) if next_send_at > now => next_send_at,
-            _ => now,
-        };
-        self.next_send_at = Some(send_at + packet_duration);
-        send_at
-    }
-}
-
+#[cfg(test)]
 fn opus_packet_duration(packet: &[u8]) -> Result<Duration> {
     let total_samples = opus_packet_total_samples(packet)?;
     Ok(Duration::from_nanos(
@@ -36,7 +18,7 @@ fn opus_packet_duration(packet: &[u8]) -> Result<Duration> {
     ))
 }
 
-fn opus_packet_total_samples(packet: &[u8]) -> Result<u32> {
+pub(crate) fn opus_packet_total_samples(packet: &[u8]) -> Result<u32> {
     let frame_count = opus_packet_frame_count(packet)? as u32;
     let samples_per_frame = opus_packet_samples_per_frame(packet)?;
     let total_samples = frame_count * samples_per_frame;
@@ -87,129 +69,108 @@ fn opus_packet_samples_per_frame(packet: &[u8]) -> Result<u32> {
     Ok(samples_per_frame)
 }
 
-/// Bidirectional audio bridge between Mumble voice and WebRTC
-pub struct AudioBridge {
-    shutdown_tx: mpsc::Sender<()>,
+#[derive(Default)]
+struct UplinkClock {
+    last_timestamp: Option<u32>,
+    last_sequence: Option<u16>,
+    frame: u64,
+    samples: u32,
+}
+impl UplinkClock {
+    fn packet(&mut self, timestamp: u32, sequence: u16, samples: u32) -> Option<u64> {
+        if let Some(last) = self.last_sequence {
+            let delta = sequence.wrapping_sub(last);
+            if delta == 0 || delta >= 0x8000 {
+                return None;
+            }
+        }
+        if let Some(last) = self.last_timestamp {
+            let delta = timestamp.wrapping_sub(last);
+            if delta == 0 || delta >= 0x8000_0000 || delta % 480 != 0 {
+                return None;
+            }
+            self.frame += u64::from(delta / 480);
+        }
+        self.last_timestamp = Some(timestamp);
+        self.last_sequence = Some(sequence);
+        self.samples = samples;
+        Some(self.frame)
+    }
+    fn end_frame(&self) -> u64 {
+        self.frame + u64::from(self.samples / 480)
+    }
 }
 
+pub struct AudioBridge {
+    tasks: Vec<JoinHandle<()>>,
+}
 impl AudioBridge {
-    /// Start the audio bridge
-    ///
-    /// - `mumble_voice_rx`: incoming Opus from Mumble server
-    /// - `mumble_voice_tx`: outgoing Opus to Mumble server
-    /// - `webrtc_audio_rx`: incoming Opus from browser via WebRTC
-    /// - `webrtc_track`: outgoing Opus track to browser via WebRTC
     pub fn start(
         mut mumble_voice_rx: mpsc::Receiver<MumbleVoiceData>,
         mumble_voice_tx: mpsc::Sender<WebrtcVoiceData>,
-        mut webrtc_audio_rx: mpsc::UnboundedReceiver<IncomingAudioPacket>,
-        webrtc_track: Arc<TrackLocalStaticSample>,
+        mut webrtc_audio_rx: mpsc::Receiver<IncomingAudioPacket>,
+        speakers: Arc<SpeakerTracks>,
     ) -> Self {
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-        // Mumble → WebRTC: forward Opus from Mumble to browser
-        let track = webrtc_track.clone();
-        let _shutdown_rx2 = shutdown_tx.clone();
-        tokio::spawn(async move {
-            let mut pacer = SendPacer::default();
-
+        let downlink = tokio::spawn(async move {
+            while let Some(data) = mumble_voice_rx.recv().await {
+                if let Err(error) = speakers.write(data).await {
+                    warn!("Dropping invalid Mumble audio: {}", error);
+                }
+            }
+        });
+        let uplink = tokio::spawn(async move {
+            let mut clock = UplinkClock::default();
+            let mut last_packet = None;
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
             loop {
                 tokio::select! {
-                    voice = mumble_voice_rx.recv() => {
-                        match voice {
-                            Some(data) => {
-                                let packet_duration = match opus_packet_duration(&data.opus_data) {
-                                    Ok(packet_duration) => packet_duration,
-                                    Err(err) => {
-                                        warn!("Dropping invalid Opus packet from Mumble: {}", err);
-                                        continue;
-                                    }
-                                };
-
-                                let send_at = pacer.schedule(Instant::now(), packet_duration);
-                                let sleep = sleep_until(send_at);
-                                tokio::pin!(sleep);
-
-                                tokio::select! {
-                                    _ = &mut sleep => {}
-                                    _ = shutdown_rx.recv() => {
-                                        debug!("Bridge shutdown (mumble→webrtc)");
-                                        break;
-                                    }
-                                }
-
-                                let sample = Sample {
-                                    data: data.opus_data,
-                                    duration: packet_duration,
-                                    timestamp: SystemTime::now(),
-                                    ..Default::default()
-                                };
-
-                                if let Err(e) = track.write_sample(&sample).await {
-                                    warn!("Failed to write Opus sample to WebRTC: {}", e);
-                                }
-                            }
-                            None => {
-                                debug!("Mumble voice channel closed");
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        debug!("Bridge shutdown (mumble→webrtc)");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // WebRTC → Mumble: forward Opus from browser to Mumble
-        tokio::spawn(async move {
-            let mut mumble_seq: u64 = 0;
-
-            loop {
-                match webrtc_audio_rx.recv().await {
-                    Some(packet) => {
-                        mumble_seq += 1;
-                        let voice_data = WebrtcVoiceData {
-                            seq_num: mumble_seq,
-                            opus_data: packet.opus_data,
-                            last_frame: false,
+                    packet = webrtc_audio_rx.recv() => {
+                        let Some(packet) = packet else { break; };
+                        if packet.received_at.elapsed().as_millis() > 120 { continue; }
+                        let samples = match opus_packet_total_samples(&packet.opus_data) {
+                            Ok(samples) if samples % 480 == 0 => samples,
+                            _ => continue,
                         };
-                        // Use try_send: drop packets rather than blocking
-                        // when the Mumble UDP sender can't keep up
-                        match mumble_voice_tx.try_send(voice_data) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                debug!("Mumble voice tx closed");
-                                break;
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                debug!("Mumble voice buffer full, dropping outgoing packet");
-                            }
-                        }
+                        let Some(seq_num) = clock.packet(packet.timestamp, packet.seq_num, samples) else { continue; };
+                        last_packet = Some(tokio::time::Instant::now());
+                        let frame = WebrtcVoiceData { seq_num, opus_data: packet.opus_data, last_frame: false };
+                        if let Err(mpsc::error::TrySendError::Closed(_)) = mumble_voice_tx.try_send(frame) { break; }
                     }
-                    None => {
-                        debug!("WebRTC audio channel closed");
-                        break;
+                    _ = tick.tick() => {
+                        if last_packet.is_some_and(|last: tokio::time::Instant| last.elapsed() >= Duration::from_millis(200)) {
+                            // End a talk spurt during DTX or an interrupted microphone stream.
+                            let _ = mumble_voice_tx.try_send(WebrtcVoiceData { seq_num: clock.end_frame(), opus_data: bytes::Bytes::new(), last_frame: true });
+                            last_packet = None;
+                        }
                     }
                 }
             }
+            debug!("Audio uplink stopped");
         });
-
-        AudioBridge { shutdown_tx }
+        Self {
+            tasks: vec![downlink, uplink],
+        }
     }
-
-    pub async fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(()).await;
+    pub async fn shutdown(mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+impl Drop for AudioBridge {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{opus_packet_duration, SendPacer};
-    use tokio::time::{Duration, Instant};
-
+    use super::*;
     #[test]
     fn parses_single_frame_opus_duration() {
         let packet = [0xF8];
@@ -254,26 +215,15 @@ mod tests {
     }
 
     #[test]
-    fn pacer_keeps_bursty_packets_on_media_clock() {
-        let mut pacer = SendPacer::default();
-        let start = Instant::now();
-
-        let first = pacer.schedule(start, Duration::from_millis(20));
-        let second = pacer.schedule(start + Duration::from_millis(1), Duration::from_millis(40));
-
-        assert_eq!(first, start);
-        assert_eq!(second, start + Duration::from_millis(20));
-    }
-
-    #[test]
-    fn pacer_resets_when_stream_falls_behind() {
-        let mut pacer = SendPacer::default();
-        let start = Instant::now();
-
-        let _ = pacer.schedule(start, Duration::from_millis(20));
-        let scheduled =
-            pacer.schedule(start + Duration::from_millis(80), Duration::from_millis(20));
-
-        assert_eq!(scheduled, start + Duration::from_millis(80));
+    fn uplink_counts_ten_ms_frames_and_preserves_loss_dtx_and_wraparound() {
+        let mut clock = UplinkClock::default();
+        let start = u32::MAX - 479;
+        assert_eq!(clock.packet(start, 65534, 960), Some(0));
+        assert_eq!(clock.packet(start.wrapping_add(960), 65535, 1920), Some(2));
+        assert_eq!(clock.packet(start.wrapping_add(2880), 0, 960), Some(6));
+        assert_eq!(clock.packet(start.wrapping_add(5760), 3, 960), Some(12));
+        assert_eq!(clock.packet(start.wrapping_add(4800), 2, 960), None);
+        assert_eq!(clock.packet(start.wrapping_add(53760), 4, 960), Some(112));
+        assert_eq!(clock.end_frame(), 114);
     }
 }

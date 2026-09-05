@@ -9,6 +9,10 @@ pub enum ClientMessage {
     Connect(ConnectData),
     Disconnect,
     Offer(OfferData),
+    Answer(AnswerData),
+    StartVoice,
+    IceRestart,
+    IceRefresh,
     IceCandidate(IceCandidateData),
     ChatSend(ChatSendData),
     ChannelJoin(ChannelJoinData),
@@ -21,12 +25,12 @@ pub struct ConnectData {
     pub username: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OfferData {
     pub sdp: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IceCandidateData {
     pub candidate: String,
     #[serde(default)]
@@ -62,7 +66,9 @@ pub struct DeafenData {
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
-    Answer(AnswerData),
+    Offer(OfferData),
+    IceCandidate(IceCandidateData),
+    IceConfig(crate::turn::credentials::IceConfig),
     Connected(ConnectedData),
     UserJoined(UserInfo),
     UserLeft(UserLeftData),
@@ -72,13 +78,15 @@ pub enum ServerMessage {
     Error(ErrorData),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerData {
     pub sdp: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectedData {
+    pub protocol_version: u8,
+    pub ice: crate::turn::credentials::IceConfig,
     pub session_id: u32,
     pub channels: Vec<ChannelInfo>,
     pub users: Vec<UserInfo>,

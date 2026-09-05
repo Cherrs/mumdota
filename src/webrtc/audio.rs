@@ -2,10 +2,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 use webrtc::peer_connection::OnTrackHdlrFn;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_remote::TrackRemote;
 
 use bytes::Bytes;
@@ -17,27 +15,11 @@ pub struct IncomingAudioPacket {
     pub opus_data: Bytes,
     pub seq_num: u16,
     pub timestamp: u32,
-}
-
-/// Create an Opus audio track for sending audio to the browser
-pub fn create_opus_track(track_id: &str, stream_id: &str) -> Arc<TrackLocalStaticSample> {
-    Arc::new(TrackLocalStaticSample::new(
-        RTCRtpCodecCapability {
-            mime_type: "audio/opus".to_owned(),
-            clock_rate: 48000,
-            channels: 2,
-            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
-            ..Default::default()
-        },
-        track_id.to_owned(),
-        stream_id.to_owned(),
-    ))
+    pub received_at: std::time::Instant,
 }
 
 /// Set up handler for receiving audio from the browser via WebRTC
-pub fn setup_incoming_audio_handler(
-    audio_tx: mpsc::UnboundedSender<IncomingAudioPacket>,
-) -> OnTrackHdlrFn {
+pub fn setup_incoming_audio_handler(audio_tx: mpsc::Sender<IncomingAudioPacket>) -> OnTrackHdlrFn {
     Box::new(
         move |track: Arc<TrackRemote>,
               _receiver: Arc<RTCRtpReceiver>,
@@ -51,7 +33,13 @@ pub fn setup_incoming_audio_handler(
 
             Box::pin(async move {
                 // Only handle audio tracks
-                if track.kind() != webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio {
+                if track.kind() != webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio
+                    || !track
+                        .codec()
+                        .capability
+                        .mime_type
+                        .eq_ignore_ascii_case("audio/opus")
+                {
                     return;
                 }
 
@@ -63,10 +51,11 @@ pub fn setup_incoming_audio_handler(
                                     opus_data: rtp_packet.payload,
                                     seq_num: rtp_packet.header.sequence_number,
                                     timestamp: rtp_packet.header.timestamp,
+                                    received_at: std::time::Instant::now(),
                                 };
-                                if tx.send(packet).is_err() {
-                                    debug!("Audio receiver closed");
-                                    break;
+                                match tx.try_send(packet) {
+                                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                                 }
                             }
                             Err(e) => {
