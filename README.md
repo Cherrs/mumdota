@@ -35,17 +35,19 @@ GitHub Actions checks source changes on PRs and publishes images only on `master
 
 ## Configuration
 
-The tracked `config.toml` is a runnable direct-only default. Enable TURN explicitly and set the reachable public IPv4 address before deployment. Keep private configuration in an ignored `config.local.toml` or environment variables. No TURN shared secret or static username/password is needed.
+The tracked `config.toml` is a runnable direct-only default that connects to a local Mumble server at `127.0.0.1:64738`. Set `MUMDOTA_MUMBLE_HOST` to the actual upstream host before deploying or upgrading; there is no built-in production host. Enable TURN explicitly and set the reachable public IPv4 address before deployment. Keep private configuration in an ignored `config.local.toml` or environment variables. No TURN shared secret or static username/password is needed.
+
+All domains below are examples. Keep the real upstream host, TURN hostname and allowed website origins in deployment configuration, such as Kubernetes ConfigMaps/Secrets or an ignored `deploy/kubernetes.local.yaml`. Removing public source references does not erase Git history or hide addresses from connected browsers.
 
 ```toml
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
 max_connections = 100
-allowed_origins = ["https://playdota2.win"]
+allowed_origins = ["https://example.com"] # Replace with the deployed website origin.
 
 [mumble]
-host = "m.playdota2.win"
+host = "m.example.com"
 port = 64738
 accept_invalid_certs = true # Set false when the upstream has a trusted certificate.
 
@@ -59,7 +61,7 @@ enabled = true
 listen_addr = "0.0.0.0"
 port = 3478
 public_ip = "203.0.113.10" # Must equal webrtc.public_ip.
-public_host = "turn.playdota2.win" # DNS-only A record pointing to that IPv4.
+public_host = "turn.example.com" # DNS-only A record pointing to that IPv4.
 realm = "mumdota"
 relay_min_port = 49160
 relay_max_port = 49999
@@ -95,7 +97,7 @@ docker run -d --name mumdota --network host \
   ghcr.io/cherrs/mumdota:master config.local.toml
 ```
 
-For Kubernetes, edit [deploy/kubernetes.yaml](deploy/kubernetes.yaml). It uses one `hostNetwork` pod on a selected node, `Recreate` updates, an HTTP Service/Ingress, and a mounted TURN certificate Secret. Replace the example IP, node label, image digest and TLS Secret names; adapt the ingress class to your cluster. Ensure the selected node has `mumdota-media=true`. The TURN certificate Secret must contain `tls.crt` and `tls.key`; an existing coturn certificate for the same hostname can be reused by changing the Secret reference.
+For Kubernetes, copy [deploy/kubernetes.yaml](deploy/kubernetes.yaml) to ignored `deploy/kubernetes.local.yaml` and edit that private copy. It uses one `hostNetwork` pod on a selected node, `Recreate` updates, an HTTP Service/Ingress, and a mounted TURN certificate Secret. Replace all example domains (including the upstream host and allowed origin), public IP, node label, image digest and TLS Secret names; adapt the ingress class to your cluster. Ensure the selected node has `mumdota-media=true`. The TURN certificate Secret must contain `tls.crt` and `tls.key`; an existing coturn certificate for the same hostname can be reused by changing the Secret reference.
 
 Keep one replica per advertised endpoint. Credentials and allocations are process-local; placing independent replicas behind a randomly balanced TURN/WS address will break authentication and media affinity. Scaling requires routing each session to the same MumDota instance for WSS, media and TURN.
 
@@ -103,18 +105,18 @@ Keep one replica per advertised endpoint. Credentials and allocations are proces
 
 | Endpoint | Exposure | Purpose |
 | --- | --- | --- |
-| `voice.playdota2.win:443/TCP` | Public ingress | WSS signaling and HTTP health |
+| `voice.example.com:443/TCP` | Public ingress | WSS signaling and HTTP health |
 | `8080/TCP` | Ingress / cluster only | MumDota HTTP backend |
 | Public IPv4 `50000/UDP` | Public, preserve port through NAT | Shared WebRTC media socket |
-| `turn.playdota2.win:3478/UDP` | Public | STUN and TURN UDP |
-| `turn.playdota2.win:3478/TCP` | Public | TURN TCP |
-| `turn.playdota2.win:5349/TCP` | Public if TLS enabled | TURN TLS |
+| `turn.example.com:3478/UDP` | Public | STUN and TURN UDP |
+| `turn.example.com:3478/TCP` | Public | TURN TCP |
+| `turn.example.com:5349/TCP` | Public if TLS enabled | TURN TLS |
 | `127.0.0.1:49160–49999/UDP` | Local process network only | TURN allocations for MumDota media |
 | Upstream `64738/TCP+UDP` | Outbound + reply traffic | Mumble control and encrypted voice |
 
 The allocation sockets bind loopback and relay only to the configured MumDota public media endpoint, internally mapped to loopback. This avoids depending on NAT hairpin behavior and prevents using the credentials to reach arbitrary destinations. The allocation range does not need a public Kubernetes Service or firewall opening. Leave enough local ports for all listener candidates and overlapping allocations during credential refresh; the default range has 840 ports.
 
-Use a DNS-only A record for `turn.playdota2.win`; do not attach it to the Worker or a normal HTTP Ingress. TURN TLS is not HTTPS. Standard Cloudflare proxying covers [specific HTTP/HTTPS ports](https://developers.cloudflare.com/fundamentals/reference/network-ports/), so this deployment connects directly to the TURN server. To make WSS itself direct, also use DNS-only for `voice.playdota2.win`. The website's main domain can keep its existing Worker/CDN configuration.
+Use a DNS-only A record for `turn.example.com`; do not attach it to the Worker or a normal HTTP Ingress. TURN TLS is not HTTPS. Standard Cloudflare proxying covers [specific HTTP/HTTPS ports](https://developers.cloudflare.com/fundamentals/reference/network-ports/), so this deployment connects directly to the TURN server. To make WSS itself direct, also use DNS-only for `voice.example.com`. The website's main domain can keep its existing Worker/CDN configuration.
 
 IPv4 media and TURN allocations are supported. An IPv6-only browser network needs IPv4 reachability/NAT64; native IPv6 TURN allocations and TURN TCP peer allocations (RFC 6062) are not implemented.
 

@@ -1,6 +1,6 @@
 # MumDota 浏览器协议 v2
 
-网页可部署在 Cloudflare Workers。浏览器通过 `wss://voice.playdota2.win/ws` 直达 MumDota；媒体使用 WebRTC 直连，无法直连时使用同一 MumDota 进程内置的 TURN。无需 coturn 或其他 TURN 服务。
+网页可部署在 Cloudflare Workers。浏览器通过 `wss://voice.example.com/ws` 直达 MumDota；媒体使用 WebRTC 直连，无法直连时使用同一 MumDota 进程内置的 TURN。无需 coturn 或其他 TURN 服务。
 
 v2 改为服务端发起 SDP offer。旧客户端发送 `offer` 会收到 `upgrade_required`，需要刷新并升级客户端。前后端应配套发布。
 
@@ -29,10 +29,10 @@ v2 改为服务端发起 SDP offer。旧客户端发送 `offer` 会收到 `upgra
     "users": [{"session_id":1,"name":"Player","channel_id":0,"mute":false,"deaf":false,"self_mute":false,"self_deaf":false}],
     "ice": {
       "ice_servers": [
-        {"urls":"stun:turn.playdota2.win:3478"},
-        {"urls":"turn:turn.playdota2.win:3478?transport=udp","username":"session-user","credential":"temporary-password"},
-        {"urls":"turn:turn.playdota2.win:3478?transport=tcp","username":"session-user","credential":"temporary-password"},
-        {"urls":"turns:turn.playdota2.win:5349?transport=tcp","username":"session-user","credential":"temporary-password"}
+        {"urls":"stun:turn.example.com:3478"},
+        {"urls":"turn:turn.example.com:3478?transport=udp","username":"session-user","credential":"temporary-password"},
+        {"urls":"turn:turn.example.com:3478?transport=tcp","username":"session-user","credential":"temporary-password"},
+        {"urls":"turns:turn.example.com:5349?transport=tcp","username":"session-user","credential":"temporary-password"}
       ],
       "expires_at": 2000000000
     }

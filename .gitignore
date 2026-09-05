@@ -1,6 +1,8 @@
 /target
 # config.toml is a tracked public default; keep private overrides separate.
 config.local.toml
+deploy/*.local.yaml
+deploy/*.local.yml
 .env
 .env.*
 /docs/plans/*

@@ -1,4 +1,5 @@
-# Replace public IP, node label, hosts, TLS Secrets and image digest before use.
+# Copy to ignored deploy/kubernetes.local.yaml before setting deployment values.
+# Replace public IP, node label, all example hosts/origins, TLS Secrets and image digest.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -31,7 +32,7 @@ spec:
           image: ghcr.io/cherrs/mumdota:master # Pin the tested v2 image digest.
           env:
             - name: MUMDOTA_MUMBLE_HOST
-              value: m.playdota2.win
+              value: m.example.com
             - name: MUMDOTA_WEBRTC_PUBLIC_IP
               value: "203.0.113.10" # Public IPv4 of this selected node / its 1:1 NAT.
             - name: MUMDOTA_WEBRTC_UDP_PORT
@@ -41,13 +42,13 @@ spec:
             - name: MUMDOTA_TURN_PUBLIC_IP
               value: "203.0.113.10"
             - name: MUMDOTA_TURN_PUBLIC_HOST
-              value: turn.playdota2.win
+              value: turn.example.com
             - name: MUMDOTA_TURN_TLS_CERT
               value: /etc/mumdota/tls/tls.crt
             - name: MUMDOTA_TURN_TLS_KEY
               value: /etc/mumdota/tls/tls.key
             - name: MUMDOTA_SERVER_ALLOWED_ORIGINS
-              value: https://playdota2.win
+              value: https://example.com
           ports:
             - { name: http, containerPort: 8080, protocol: TCP }
             - { name: media, containerPort: 50000, protocol: UDP }
@@ -92,10 +93,10 @@ metadata:
 spec:
   # Set ingressClassName and controller-specific WebSocket timeouts as needed.
   tls:
-    - hosts: [voice.playdota2.win]
+    - hosts: [voice.example.com]
       secretName: mumdota-wss-tls
   rules:
-    - host: voice.playdota2.win
+    - host: voice.example.com
       http:
         paths:
           - path: /
