@@ -1,4 +1,4 @@
-# Values support ${ENV_VAR} and ${ENV_VAR:-default} placeholders.
+# See README.md for environment variable placeholder syntax.
 # All fields can also be overridden via MUMDOTA_* environment variables
 # (e.g. MUMDOTA_SERVER_LISTEN_PORT=9090, MUMDOTA_MUMBLE_HOST=mumble.example.com).
 

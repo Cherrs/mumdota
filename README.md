@@ -24,6 +24,10 @@ Configuration is read from `config.toml`. All string and numeric values support 
 
 Any field can also be overridden at runtime via `MUMDOTA_*` environment variables (see table below) — these take the highest priority and do not require editing the config file.
 
+`config.toml` is a tracked public default and is included in the Docker image.
+Keep credentials in environment variables or an ignored `config.local.toml`, and run
+`cargo run -- config.local.toml` to use a private configuration. Never put secrets in the tracked default.
+
 ### config.toml reference
 
 ```toml
@@ -63,6 +67,8 @@ stun_servers = ["stun:stun.l.google.com:19302"]
 | `MUMDOTA_MUMBLE_PORT` | `mumble.port` | integer | `64738` |
 | `MUMDOTA_MUMBLE_ACCEPT_INVALID_CERTS` | `mumble.accept_invalid_certs` | bool (`1`/`true`/`yes`) | `true` |
 | `MUMDOTA_WEBRTC_STUN_SERVERS` | `webrtc.stun_servers` | comma-separated strings | `stun:stun.l.google.com:19302` |
+| `MUMDOTA_WEBRTC_TURN_USERNAME` | `webrtc.turn_username` | string | `turn-user` |
+| `MUMDOTA_WEBRTC_TURN_CREDENTIAL` | `webrtc.turn_credential` | string | supply through your secret manager |
 
 ### Inline placeholder syntax
 
@@ -87,7 +93,14 @@ host = "${MUMBLE_HOST:-mumble.example.com}"
 
 ### Option 1: Docker (Recommended)
 
-GitHub Actions CI is configured to automatically build and publish Docker images to GitHub Container Registry (GHCR) on pushes to the `master` branch or `v*` tags.
+GitHub Actions runs formatting, Clippy, and tests before it builds and publishes Docker images to GitHub Container Registry (GHCR) on pushes to the `master` branch or `v*` tags.
+You can run the same source checks locally with:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
 
 #### Using pre-built images
 

@@ -41,3 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Misc
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
+
+[dev-dependencies]
+# Generate ephemeral TLS identities for local Mumble integration tests.
+openssl = "0.10"

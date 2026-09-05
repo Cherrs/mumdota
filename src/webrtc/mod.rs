@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -18,14 +18,12 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 
 use crate::config::WebrtcConfig;
-use crate::ws::messages::IceCandidateResponse;
 
 pub use audio::IncomingAudioPacket;
 
 /// Events from WebRTC layer
 #[derive(Debug)]
 pub enum WebrtcEvent {
-    IceCandidate(IceCandidateResponse),
     ConnectionStateChanged(RTCPeerConnectionState),
 }
 
@@ -59,7 +57,6 @@ impl WebrtcSession {
                 urls: vec![url.clone()],
                 username: config.turn_username.clone().unwrap_or_default(),
                 credential: config.turn_credential.clone().unwrap_or_default(),
-                ..Default::default()
             })
             .collect();
 
@@ -85,24 +82,9 @@ impl WebrtcSession {
         let (audio_tx, audio_rx) = mpsc::unbounded_channel();
         peer_connection.on_track(audio::setup_incoming_audio_handler(audio_tx));
 
-        // Set up ICE candidate and connection state event forwarding
+        // Candidates are embedded in the answer SDP after gathering completes.
+        // Only connection state changes need an event callback.
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        let event_tx_ice = event_tx.clone();
-        peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            let tx = event_tx_ice.clone();
-            Box::pin(async move {
-                if let Some(c) = candidate {
-                    if let Ok(json) = c.to_json() {
-                        let _ = tx.send(WebrtcEvent::IceCandidate(IceCandidateResponse {
-                            candidate: json.candidate,
-                            sdp_mid: json.sdp_mid,
-                            sdp_mline_index: json.sdp_mline_index,
-                        }));
-                    }
-                }
-            })
-        }));
 
         let event_tx_state = event_tx.clone();
         peer_connection.on_peer_connection_state_change(Box::new(

@@ -202,6 +202,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shipped_default_config_loads_without_example_variables() {
+        // Use the exact file copied into the Docker image, including its comments.
+        let config = Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml"))
+            .expect("the shipped config must load without setting example variables");
+        assert!(!config.mumble.host.is_empty());
+    }
+
+    #[test]
     fn test_expand_env_vars_plain() {
         std::env::set_var("TEST_HOST", "mumble.example.com");
         let result = expand_env_vars("host = \"${TEST_HOST}\"").unwrap();

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
+use webrtc::peer_connection::OnTrackHdlrFn;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::rtp_transceiver::RTCRtpTransceiver;
@@ -36,15 +37,7 @@ pub fn create_opus_track(track_id: &str, stream_id: &str) -> Arc<TrackLocalStati
 /// Set up handler for receiving audio from the browser via WebRTC
 pub fn setup_incoming_audio_handler(
     audio_tx: mpsc::UnboundedSender<IncomingAudioPacket>,
-) -> Box<
-    dyn FnMut(
-            Arc<TrackRemote>,
-            Arc<RTCRtpReceiver>,
-            Arc<RTCRtpTransceiver>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
-        + Sync,
-> {
+) -> OnTrackHdlrFn {
     Box::new(
         move |track: Arc<TrackRemote>,
               _receiver: Arc<RTCRtpReceiver>,

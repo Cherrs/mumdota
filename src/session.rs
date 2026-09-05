@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -23,6 +23,9 @@ struct UserSession {
     username: String,
     session_id: Option<u32>,
     voice_setup_task: Option<JoinHandle<()>>,
+    slot: Option<OwnedSemaphorePermit>,
+    closed: bool,
+    close_notify: Arc<Notify>,
 }
 
 fn abort_background_task(task: &mut Option<JoinHandle<()>>) {
@@ -32,6 +35,14 @@ fn abort_background_task(task: &mut Option<JoinHandle<()>>) {
 }
 
 async fn shutdown_user_session(session: &mut UserSession) {
+    if session.slot.is_none() {
+        return;
+    }
+    session.closed = true;
+    session.close_notify.notify_one();
+    let _ = session
+        .mumble_client
+        .send_command(MumbleCommand::Disconnect);
     abort_background_task(&mut session.voice_setup_task);
 
     if let Some(bridge) = session.bridge.take() {
@@ -48,18 +59,23 @@ async fn shutdown_user_session(session: &mut UserSession) {
             session.username, err
         );
     }
+    session.slot.take();
 }
 
 /// Manages all active user sessions
+type Sessions = RwLock<HashMap<String, Arc<Mutex<UserSession>>>>;
+
 pub struct SessionManager {
-    sessions: RwLock<HashMap<String, Arc<Mutex<UserSession>>>>,
+    sessions: Arc<Sessions>,
+    slots: Arc<Semaphore>,
     config: Config,
 }
 
 impl SessionManager {
     pub fn new(config: Config) -> Self {
         SessionManager {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            slots: Arc::new(Semaphore::new(config.server.max_connections)),
             config,
         }
     }
@@ -84,16 +100,16 @@ impl SessionManager {
         username: &str,
         ws_tx: mpsc::UnboundedSender<ServerMessage>,
     ) -> Result<(), String> {
-        // Single read lock for both checks
-        {
-            let sessions = self.sessions.read().await;
-            if sessions.len() >= self.config.server.max_connections {
-                return Err("Server full".to_string());
-            }
-            if sessions.contains_key(conn_id) {
-                return Err("Already connected".to_string());
-            }
+        if self.sessions.read().await.contains_key(conn_id) {
+            return Err("Already connected".to_string());
         }
+        // Reserve capacity before DNS/TLS/WebRTC awaits. Dropping the permit on
+        // setup failure or cancellation automatically makes the slot available.
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Server full".to_string())?;
 
         // Async DNS resolution — does not block tokio worker threads
         let addr = self.resolve_mumble_addr().await?;
@@ -122,18 +138,28 @@ impl SessionManager {
             username: username.to_string(),
             session_id: None,
             voice_setup_task: None,
+            slot: Some(slot),
+            closed: false,
+            close_notify: Arc::new(Notify::new()),
         }));
 
-        self.sessions
-            .write()
-            .await
-            .insert(conn_id.to_string(), session.clone());
+        {
+            let mut sessions = self.sessions.write().await;
+            // The WebSocket handler serializes messages, but also protect direct
+            // callers from replacing a session with another in-flight connect.
+            if sessions.contains_key(conn_id) {
+                drop(sessions);
+                shutdown_user_session(&mut *session.lock().await).await;
+                return Err("Already connected".to_string());
+            }
+            sessions.insert(conn_id.to_string(), session.clone());
+        }
 
-        // Spawn event processing loop
         let conn_id_owned = conn_id.to_string();
         let config = self.config.clone();
+        let sessions = self.sessions.clone();
         tokio::spawn(async move {
-            Self::process_events(conn_id_owned, session, config).await;
+            Self::process_events(conn_id_owned, session, config, sessions).await;
         });
 
         info!("User '{}' connecting (conn_id={})", username, conn_id);
@@ -226,26 +252,60 @@ impl SessionManager {
             .map_err(|e| e.to_string())
     }
 
-    /// Disconnect user
+    /// Disconnect user without holding the global map lock during teardown.
     pub async fn disconnect_user(&self, conn_id: &str) {
-        if let Some(session) = self.sessions.write().await.remove(conn_id) {
-            let mut session = session.lock().await;
-            let _ = session
-                .mumble_client
-                .send_command(MumbleCommand::Disconnect);
-            shutdown_user_session(&mut session).await;
-            info!(
-                "User '{}' disconnected (conn_id={})",
-                session.username, conn_id
-            );
+        let session = self.sessions.write().await.remove(conn_id);
+        if let Some(session) = session {
+            shutdown_user_session(&mut *session.lock().await).await;
+            info!("User disconnected (conn_id={})", conn_id);
         }
     }
 
-    /// Process Mumble events and WebRTC events for a session
-    async fn process_events(conn_id: String, session: Arc<Mutex<UserSession>>, config: Config) {
+    /// Remove only this generation: an old event task must not remove a reconnect.
+    async fn finish_session(
+        sessions: &Sessions,
+        conn_id: &str,
+        session: &Arc<Mutex<UserSession>>,
+        terminal_error: Option<ServerMessage>,
+    ) -> bool {
+        let ws_tx = {
+            let mut session = session.lock().await;
+            shutdown_user_session(&mut session).await;
+            session.ws_tx.clone()
+        };
+        let mut sessions = sessions.write().await;
+        if sessions
+            .get(conn_id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(conn_id);
+            // Removal and notification are synchronous under the map lock, so a
+            // reconnect cannot be inserted between them and get a stale error.
+            if let Some(error) = terminal_error {
+                let _ = ws_tx.send(error);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Process Mumble events and WebRTC events for a session.
+    async fn process_events(
+        conn_id: String,
+        session: Arc<Mutex<UserSession>>,
+        config: Config,
+        sessions: Arc<Sessions>,
+    ) {
+        // Initialization and storing the task handle share the session lock with
+        // teardown, so disconnect cannot race with spawning a new voice task.
+        let mut s = session.lock().await;
+        if s.closed {
+            return;
+        }
+        let close_notify = s.close_notify.clone();
         // Take event receivers out of the session to avoid holding the lock
         let (mut mumble_event_rx, mut webrtc_event_rx, ws_tx, crypt_state_rx) = {
-            let mut s = session.lock().await;
             let mumble_rx =
                 std::mem::replace(&mut s.mumble_client.event_rx, mpsc::unbounded_channel().1);
             let webrtc_rx =
@@ -324,13 +384,15 @@ impl SessionManager {
             }
         });
 
-        {
-            let mut s = session.lock().await;
-            s.voice_setup_task = Some(voice_setup_task);
-        }
+        s.voice_setup_task = Some(voice_setup_task);
+        drop(s);
 
+        let mut terminal_error = None;
         loop {
             tokio::select! {
+                biased;
+                _ = close_notify.notified() => break,
+                _ = ws_tx.closed() => break,
                 event = mumble_event_rx.recv() => {
                     match event {
                         Some(MumbleEvent::Connected { session_id, channels, users }) => {
@@ -339,6 +401,9 @@ impl SessionManager {
                             }
                             {
                                 let mut s = session.lock().await;
+                                if s.closed {
+                                    break;
+                                }
                                 s.session_id = Some(session_id);
                             }
                             let _ = ws_tx.send(ServerMessage::Connected(ConnectedData {
@@ -388,7 +453,7 @@ impl SessionManager {
                         }
                         Some(MumbleEvent::Disconnected(reason)) => {
                             warn!("Mumble disconnected for {}: {}", conn_id, reason);
-                            let _ = ws_tx.send(ServerMessage::error("mumble_disconnected", reason));
+                            terminal_error = Some(ServerMessage::error("mumble_disconnected", reason));
                             break;
                         }
                         None => {
@@ -398,11 +463,6 @@ impl SessionManager {
                 }
                 event = webrtc_event_rx.recv() => {
                     match event {
-                        Some(WebrtcEvent::IceCandidate(_)) => {
-                            // Candidates are already embedded in the answer SDP (vanilla ICE);
-                            // sending them individually would arrive before the answer and
-                            // cause addIceCandidate to fail on the client.
-                        }
                         Some(WebrtcEvent::ConnectionStateChanged(state)) => {
                             if state == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed
                                 || state == webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Disconnected
@@ -420,40 +480,11 @@ impl SessionManager {
                 }
             }
         }
+        // Release capacity before telling the browser it can reconnect. If this
+        // session was explicitly replaced, do not send a stale terminal error.
+        Self::finish_session(&sessions, &conn_id, &session, terminal_error).await;
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::oneshot;
-    use tokio::time::{timeout, Duration};
-
-    struct DropSignal(Option<oneshot::Sender<()>>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            if let Some(tx) = self.0.take() {
-                let _ = tx.send(());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn abort_background_task_cancels_pending_work() {
-        let (drop_tx, drop_rx) = oneshot::channel();
-        let mut task = Some(tokio::spawn(async move {
-            let _signal = DropSignal(Some(drop_tx));
-            std::future::pending::<()>().await;
-        }));
-        tokio::task::yield_now().await;
-
-        abort_background_task(&mut task);
-
-        assert!(task.is_none());
-        timeout(Duration::from_secs(1), drop_rx)
-            .await
-            .expect("task should be aborted")
-            .expect("drop signal should be delivered");
-    }
-}
+mod tests;

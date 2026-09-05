@@ -114,7 +114,6 @@ impl MumbleClient {
             let mut crypt_tx = Some(crypt_tx);
             let mut channels: HashMap<u32, ChannelInfo> = HashMap::new();
             let mut users: HashMap<u32, UserInfo> = HashMap::new();
-            let mut our_session_id: Option<u32> = None;
             let mut connected = false;
             let mut command_rx = command_rx;
 
@@ -132,7 +131,6 @@ impl MumbleClient {
                                     &mut crypt_tx,
                                     &mut channels,
                                     &mut users,
-                                    &mut our_session_id,
                                     &mut connected,
                                 ) {
                                     break;
@@ -273,7 +271,6 @@ fn handle_control_packet(
     crypt_tx: &mut Option<oneshot::Sender<ClientCryptState>>,
     channels: &mut HashMap<u32, ChannelInfo>,
     users: &mut HashMap<u32, UserInfo>,
-    our_session_id: &mut Option<u32>,
     connected: &mut bool,
 ) -> bool {
     match packet {
@@ -287,11 +284,9 @@ fn handle_control_packet(
             let id = info.id;
             if !*connected {
                 channels.insert(id, info);
-            } else if channels.contains_key(&id) {
-                channels.insert(id, info.clone());
+            } else if channels.insert(id, info.clone()).is_some() {
                 let _ = event_tx.send(MumbleEvent::ChannelUpdated(info));
             } else {
-                channels.insert(id, info.clone());
                 let _ = event_tx.send(MumbleEvent::ChannelAdded(info));
             }
         }
@@ -377,7 +372,6 @@ fn handle_control_packet(
         },
         ControlPacket::ServerSync(msg) => {
             let session_id = msg.get_session();
-            *our_session_id = Some(session_id);
             *connected = true;
             info!("Logged in with session_id={}", session_id);
 
@@ -534,7 +528,6 @@ mod tests {
         let mut crypt_tx = Some(crypt_tx);
         let mut channels = HashMap::new();
         let mut users = HashMap::new();
-        let mut our_session_id = None;
         let mut connected = false;
 
         let mut msg = msgs::CryptSetup::new();
@@ -550,7 +543,6 @@ mod tests {
                 &mut crypt_tx,
                 &mut channels,
                 &mut users,
-                &mut our_session_id,
                 &mut connected,
             );
         }));
@@ -582,7 +574,6 @@ mod tests {
             self_deaf: false,
         };
         let mut users = HashMap::from([(42, alice)]);
-        let mut our_session_id = Some(42);
         let mut connected = true;
 
         let mut msg = msgs::UserState::new();
@@ -596,7 +587,6 @@ mod tests {
             &mut crypt_tx,
             &mut channels,
             &mut users,
-            &mut our_session_id,
             &mut connected,
         );
 
@@ -626,7 +616,6 @@ mod tests {
         let mut crypt_tx = None;
         let mut channels = HashMap::new();
         let mut users = HashMap::new();
-        let mut our_session_id = Some(7);
         let mut connected = true;
 
         let mut msg = msgs::TextMessage::new();
@@ -641,7 +630,6 @@ mod tests {
             &mut crypt_tx,
             &mut channels,
             &mut users,
-            &mut our_session_id,
             &mut connected,
         );
 

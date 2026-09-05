@@ -6,13 +6,13 @@ WORKDIR /app
 # Cache dependencies separately from source
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main(){}' > src/main.rs \
-    && cargo build --release \
+    && cargo build --locked --release \
     && rm -rf src
 
 # Build the real source
 COPY src ./src
 # Touch main.rs so cargo rebuilds it after the dummy above
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --locked --release
 
 # ── runtime stage ─────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim

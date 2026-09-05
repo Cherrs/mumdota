@@ -1238,6 +1238,7 @@ dependencies = [
  "futures",
  "mumble-protocol",
  "native-tls",
+ "openssl",
  "serde",
  "serde_json",
  "tokio",

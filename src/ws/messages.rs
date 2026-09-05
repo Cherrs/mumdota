@@ -63,7 +63,6 @@ pub struct DeafenData {
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
     Answer(AnswerData),
-    IceCandidate(IceCandidateResponse),
     Connected(ConnectedData),
     UserJoined(UserInfo),
     UserLeft(UserLeftData),
@@ -76,13 +75,6 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize)]
 pub struct AnswerData {
     pub sdp: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct IceCandidateResponse {
-    pub candidate: String,
-    pub sdp_mid: Option<String>,
-    pub sdp_mline_index: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
